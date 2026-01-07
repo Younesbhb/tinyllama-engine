@@ -1,0 +1,8 @@
+venv/
+
+# GGUF models
+*.gguf
+
+*.o
+*.dSYM
+engine
