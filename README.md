@@ -79,7 +79,7 @@ Building this requires combining disciplines usually taught separately:
 | 7 | KV Cache | Planned |
 | 8 | SIMD optimization (ARM NEON) | Planned |
 | 9 | Quantization optimization | Planned |
-| 9 | PagedAttention optimization | Planned |
+| 10 | PagedAttention optimization | Planned |
 
 
 ## Technical Details
