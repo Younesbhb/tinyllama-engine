@@ -6,3 +6,6 @@ venv/
 *.o
 *.dSYM
 engine
+test_ops
+
+.DS_Store

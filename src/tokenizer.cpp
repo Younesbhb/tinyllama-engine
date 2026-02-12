@@ -1,6 +1,6 @@
 #include "tokenizer.h"
 #include <algorithm>  // for std::min
-
+#include <stdexcept>
 
 // Initialize vocab_ and scores_ and token_to_id_
 void Tokenizer::load(std::vector<std::string>&& vocab, std::vector<float>&& scores) {
