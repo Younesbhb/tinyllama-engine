@@ -12,12 +12,15 @@
 
 #include "gguf.h"
 #include "tokenizer.h"
+#include "ops.h"
+#include "run_state.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <iomanip> // for precision output
+#include <cmath>
 // -------------------- small helpers --------------------
 
 static std::string sys_err(const char* what) {
@@ -625,6 +628,260 @@ private:
     }
 };
 
+// -------------------- Helper: Embedding Lookup --------------------
+//
+// The embedding table is a big matrix: [32000 × 2048]
+// Each row is one token's "meaning" as a vector of 2048 numbers.
+// This function copies row `token` into the output buffer,
+// converting from F16 to F32 if needed.
+//
+// This is NOT a matmul — it's just a table lookup. No math,
+// just "give me the 2048 numbers for token #15043."
+
+static void embed_token(float* out, const GGUFModel& model, int token) {
+    const auto& t = model.tensor_info("token_embd.weight");
+    const std::uint8_t* data = model.tensor_bytes(t);
+    int n_embd = static_cast<int>(model.config().n_embd);
+
+    if (t.type == GGML_TYPE_F16) {
+        // F16: each weight is 2 bytes, need to convert to F32
+        const std::uint16_t* emb = reinterpret_cast<const std::uint16_t*>(data);
+        const std::uint16_t* row = emb + static_cast<std::size_t>(token) * n_embd;
+        for (int i = 0; i < n_embd; i++) {
+            out[i] = fp16_to_f32(row[i]);
+        }
+    } else if (t.type == GGML_TYPE_F32) {
+        // F32: each weight is 4 bytes, can copy directly
+        const float* emb = reinterpret_cast<const float*>(data);
+        const float* row = emb + static_cast<std::size_t>(token) * n_embd;
+        for (int i = 0; i < n_embd; i++) {
+            out[i] = row[i];
+        }
+    } else {
+        throw std::runtime_error("Unsupported embedding type");
+    }
+}
+
+
+// -------------------- Helper: Get Norm Weights --------------------
+//
+// RMSNorm weights are small 1D vectors (2048 floats = 8KB).
+// They're always stored as F32 even in F16 models because:
+//   - They're tiny (no memory savings from quantizing)
+//   - Precision matters for normalization stability
+
+static const float* get_norm_weight(const GGUFModel& model, const std::string& name) {
+    const auto& t = model.tensor_info(name);
+    if (t.type != GGML_TYPE_F32) {
+        throw std::runtime_error("Expected F32 norm weight: " + name);
+    }
+    return reinterpret_cast<const float*>(model.tensor_bytes(t));
+}
+
+
+// -------------------- Helper: Get Weight Pointer + Type --------------------
+//
+// For matmul, we need both the raw pointer and the type
+// (so matmul knows whether to use F16 or F32 path).
+
+struct WeightRef {
+    const void* data;
+    ggml_type type;
+};
+
+static WeightRef get_weight(const GGUFModel& model, const std::string& name) {
+    const auto& t = model.tensor_info(name);
+    return { model.tensor_bytes(t), t.type };
+}
+
+
+// -------------------- The Forward Pass --------------------
+//
+// This is where everything comes together. One call to this function
+// processes a single token through the entire model.
+//
+// Input:  a token ID (like 15043 for "Hello") and its position
+// Output: state.logits filled with 32000 scores (one per vocab word)
+//
+// The flow:
+//
+//   Token ID ─── embed_token ───► x [2048]
+//                                  │
+//        ┌─────────────────────────┤  (repeat 22 times)
+//        │                         ▼
+//        │              rmsnorm ──► xb [2048]
+//        │                         │
+//        │              matmul(W_q, xb) ──► q  [2048]
+//        │              matmul(W_k, xb) ──► k  [256]
+//        │              matmul(W_v, xb) ──► v  [256]
+//        │                         │
+//        │              rope(q, k, pos)
+//        │                         │
+//        │              attention ──► xb2 [2048]
+//        │                         │
+//        │              matmul(W_o, xb2) ──► xb [2048]
+//        │                         │
+//        │              x = x + xb  (residual)
+//        │                         │
+//        │              rmsnorm ──► xb [2048]
+//        │                         │
+//        │              ffn_swiglu ──► xb2 [2048]
+//        │                         │
+//        │              x = x + xb2 (residual)
+//        │                         │
+//        └─────────────────────────┘
+//                                  │
+//                       rmsnorm ──► x [2048]  (final norm, in-place)
+//                                  │
+//                       matmul(W_out, x) ──► logits [32000]
+//
+
+static void forward(GGUFModel& model, RunState& state, int token, int pos) {
+    const auto& cfg = model.config();
+    int n_embd  = static_cast<int>(cfg.n_embd);
+    int n_layers = static_cast<int>(cfg.n_layers);
+    int n_ff    = static_cast<int>(cfg.n_ff);
+    int kv_dim  = static_cast<int>(cfg.n_head_kv * cfg.head_dim());
+
+
+    // ============================================================
+    // Step 1: Embedding Lookup
+    // ============================================================
+    // Convert token ID → 2048-dimensional vector.
+    // "Hello" (ID 15043) → [0.023, -0.841, 0.127, ..., 0.445]
+    //
+    // This is the starting point. These 2048 numbers are the model's
+    // initial "understanding" of this word, before any context.
+
+    embed_token(state.x, model, token);
+
+
+    // ============================================================
+    // Step 2: Transformer Layers (the main loop)
+    // ============================================================
+    // Each layer refines the representation.
+    // After 22 layers of refinement, x contains enough information
+    // to predict the next word.
+
+    for (int l = 0; l < n_layers; l++) {
+
+        // Build tensor name prefix for this layer: "blk.0.", "blk.1.", etc.
+        std::string prefix = "blk." + std::to_string(l) + ".";
+
+
+        // ---- ATTENTION HALF ----
+
+        // RMSNorm: normalize x before attention.
+        // Result goes to xb (we need original x for the residual later).
+        const float* attn_norm_w = get_norm_weight(model, prefix + "attn_norm.weight");
+        rmsnorm(state.xb, state.x, attn_norm_w, n_embd, cfg.rms_norm_eps);
+
+        // Q, K, V projections: multiply normalized input by weight matrices.
+        // This creates the query ("what am I looking for?"),
+        // key ("what do I contain?"), and value ("here's my content")
+        // for this token.
+        auto wq = get_weight(model, prefix + "attn_q.weight");
+        auto wk = get_weight(model, prefix + "attn_k.weight");
+        auto wv = get_weight(model, prefix + "attn_v.weight");
+
+        matmul(state.q, wq.data, state.xb, n_embd, n_embd, wq.type);
+        matmul(state.k, wk.data, state.xb, kv_dim,  n_embd, wk.type);
+        matmul(state.v, wv.data, state.xb, kv_dim,  n_embd, wv.type);
+
+        // RoPE: rotate Q and K to encode position information.
+        // Without this, "dog bites man" and "man bites dog" look the same.
+        rope(state.q, state.k, pos,
+             static_cast<int>(cfg.head_dim()),
+             static_cast<int>(cfg.n_head),
+             static_cast<int>(cfg.n_head_kv),
+             cfg.rope_freq_base);
+
+        // Attention: look back at all previous tokens, compute relevance
+        // scores, and blend their values. Result → xb2
+        attention(state.xb2, state.q, state.k, state.v,
+                  state.key_cache, state.value_cache, state.att,
+                  l, pos, cfg);
+
+        // Output projection: convert attention output back to hidden dimension.
+        // Result → xb (we're done with the old xb from rmsnorm)
+        auto wo = get_weight(model, prefix + "attn_output.weight");
+        matmul(state.xb, wo.data, state.xb2, n_embd, n_embd, wo.type);
+
+        // Residual connection: add attention's contribution to original signal.
+        // x = x + attention_output
+        // The original x passes through unchanged; attention just adds to it.
+        vec_add(state.x, state.xb, n_embd);
+
+
+        // ---- FFN HALF ----
+
+        // RMSNorm: normalize x before FFN.
+        const float* ffn_norm_w = get_norm_weight(model, prefix + "ffn_norm.weight");
+        rmsnorm(state.xb, state.x, ffn_norm_w, n_embd, cfg.rms_norm_eps);
+
+        // SwiGLU FFN: expand to 5632 dims, process, shrink back to 2048.
+        // This is the "thinking" step. Result → xb2
+        auto wgate = get_weight(model, prefix + "ffn_gate.weight");
+        auto wup   = get_weight(model, prefix + "ffn_up.weight");
+        auto wdown = get_weight(model, prefix + "ffn_down.weight");
+
+        ffn_swiglu(state.xb2, state.xb,
+                   state.hb, state.hb2,
+                   wgate.data, wup.data, wdown.data,
+                   n_ff, n_embd, wgate.type);
+
+        // Residual connection: add FFN's contribution.
+        // x = x + ffn_output
+        vec_add(state.x, state.xb2, n_embd);
+    }
+
+
+    // ============================================================
+    // Step 3: Final RMSNorm
+    // ============================================================
+    // One last normalization before projecting to vocabulary.
+    // This is in-place: x gets normalized directly (no need to
+    // preserve the old x since there are no more residual connections).
+
+    const float* final_norm_w = get_norm_weight(model, "output_norm.weight");
+    rmsnorm(state.x, state.x, final_norm_w, n_embd, cfg.rms_norm_eps);
+
+
+    // ============================================================
+    // Step 4: Project to Vocabulary → Logits
+    // ============================================================
+    // Multiply the 2048-dim hidden state by a [32000 × 2048] matrix
+    // to get one score per vocabulary word.
+    //
+    // TinyLlama uses "tied embeddings": the output matrix is the SAME
+    // as the input embedding matrix. Instead of storing two 32000×2048
+    // matrices, it reuses one. We check if "output.weight" exists;
+    // if not, we fall back to "token_embd.weight".
+    //
+    // After this, state.logits[i] = how likely token i is to be next.
+    // High logit = likely. Low logit = unlikely.
+
+    WeightRef w_out;
+    bool found_output = false;
+    try {
+        w_out = get_weight(model, "output.weight");
+        found_output = true;
+    } catch (...) {
+        // Tied embeddings: reuse token embedding weights
+    }
+    if (!found_output) {
+        w_out = get_weight(model, "token_embd.weight");
+    }
+
+    matmul(state.logits, w_out.data, state.x,
+           static_cast<int>(cfg.n_vocab), n_embd, w_out.type);
+
+    // state.logits now contains 32000 scores.
+    // To get the next token: apply softmax, then sample.
+}
+
+
+
 // -------------------- main --------------------
 
 int main(int argc, char** argv) {
@@ -711,6 +968,23 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Forward pass smoke test
+        RunState state;
+        state.allocate(model.config());
+        int bos = static_cast<int>(model.tokenizer().bos_token());
+        forward(model, state, bos, 0);
+
+        // Find top prediction
+        float max_logit = state.logits[0];
+        int max_id = 0;
+        for (int i = 1; i < static_cast<int>(model.config().n_vocab); i++) {
+            if (state.logits[i] > max_logit) {
+                max_logit = state.logits[i];
+                max_id = i;
+            }
+        }
+        std::cout << "Top prediction after BOS: token " << max_id 
+        << " (\"" << model.tokenizer().decode_stripped({static_cast<uint32_t>(max_id)}) << "\")\n";
 
         if (argc >= 4 && std::string(argv[2]) == "dump") {
             std::string name = argv[3];
