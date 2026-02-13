@@ -212,6 +212,86 @@ void test_vec_add() {
           approx_equal(out[2], 33.0f));
 }
 
+void test_ffn_swiglu() {
+    std::cout << "\n=== ffn_swiglu ===\n";
+
+    // Use small dimensions to verify by hand
+    // n_embd = 2, n_ff = 3
+    int n_embd = 2;
+    int n_ff = 3;
+
+    float input[] = {1.0f, 2.0f};
+    float hb[3] = {0};
+    float hb2[3] = {0};
+    float out[2] = {0};
+
+    // W_gate [3x2]: [[1,0],[0,1],[1,1]]
+    // W_up   [3x2]: [[1,1],[0,1],[1,0]]
+    // W_down [2x3]: [[1,0,1],[0,1,0]]
+    float W_gate[] = {1,0, 0,1, 1,1};
+    float W_up[]   = {1,1, 0,1, 1,0};
+    float W_down[] = {1,0,1, 0,1,0};
+
+    // Trace through manually:
+    // Step 1: gate = W_gate * [1,2] = [1*1+0*2, 0*1+1*2, 1*1+1*2] = [1, 2, 3]
+    // Step 2: up   = W_up   * [1,2] = [1*1+1*2, 0*1+1*2, 1*1+0*2] = [3, 2, 1]
+    // Step 3: silu(gate) = [silu(1), silu(2), silu(3)]
+    //         silu(1) = 1*sigmoid(1) = 0.7311
+    //         silu(2) = 2*sigmoid(2) = 1.7616
+    //         silu(3) = 3*sigmoid(3) = 2.8577
+    // Step 4: gate ⊙ up = [0.7311*3, 1.7616*2, 2.8577*1]
+    //                    = [2.1933, 3.5232, 2.8577]
+    // Step 5: out = W_down * [2.1933, 3.5232, 2.8577]
+    //         out[0] = 1*2.1933 + 0*3.5232 + 1*2.8577 = 5.0510
+    //         out[1] = 0*2.1933 + 1*3.5232 + 0*2.8577 = 3.5232
+
+    ffn_swiglu(out, input, hb, hb2, W_gate, W_up, W_down,
+               n_ff, n_embd, GGML_TYPE_F32);
+
+    float silu_1 = 1.0f / (1.0f + std::exp(-1.0f));        // 0.7311
+    float silu_2 = 2.0f / (1.0f + std::exp(-2.0f));        // 1.7616
+    float silu_3 = 3.0f / (1.0f + std::exp(-3.0f));        // 2.8577
+
+    float expected_0 = silu_1 * 3.0f + silu_3 * 1.0f;      // 5.0510
+    float expected_1 = silu_2 * 2.0f;                       // 3.5232
+
+    print_vec("out", out, 2);
+    std::cout << "    expected: [" << expected_0 << ", " << expected_1 << "]\n";
+    check("FFN output[0] correct", approx_equal(out[0], expected_0, 1e-3f));
+    check("FFN output[1] correct", approx_equal(out[1], expected_1, 1e-3f));
+
+    // --- Test 2: Zero input → zero output ---
+    // silu(0) = 0, so gate is all zeros, so gate ⊙ up = all zeros
+    float zero_input[] = {0.0f, 0.0f};
+    ffn_swiglu(out, zero_input, hb, hb2, W_gate, W_up, W_down,
+               n_ff, n_embd, GGML_TYPE_F32);
+    check("zero input → zero output", approx_equal(out[0], 0.0f) && approx_equal(out[1], 0.0f));
+
+    // --- Test 3: No NaN/Inf with realistic dimensions ---
+    {
+        int big_embd = 64;
+        int big_ff = 128;
+        std::vector<float> big_input(big_embd, 0.5f);
+        std::vector<float> big_hb(big_ff);
+        std::vector<float> big_hb2(big_ff);
+        std::vector<float> big_out(big_embd);
+        std::vector<float> big_gate(big_ff * big_embd, 0.01f);
+        std::vector<float> big_up(big_ff * big_embd, 0.01f);
+        std::vector<float> big_down(big_embd * big_ff, 0.01f);
+
+        ffn_swiglu(big_out.data(), big_input.data(),
+                   big_hb.data(), big_hb2.data(),
+                   big_gate.data(), big_up.data(), big_down.data(),
+                   big_ff, big_embd, GGML_TYPE_F32);
+
+        bool no_nan = true;
+        for (int i = 0; i < big_embd; i++) {
+            if (std::isnan(big_out[i]) || std::isinf(big_out[i])) { no_nan = false; break; }
+        }
+        check("larger dimensions: no NaN/Inf", no_nan);
+    }
+}
+
 void test_attention() {
     std::cout << "\n=== attention ===\n";
 
@@ -513,6 +593,7 @@ int main() {
     test_silu();
     test_elementwise_mul();
     test_vec_add();
+    test_ffn_swiglu();
     test_attention();
     test_rope();
     test_matmul_realistic_size();

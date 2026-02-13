@@ -477,3 +477,52 @@ void attention(float* out, const float* q, const float* k, const float* v,
     // At this point, out[0..2047] contains the concatenated output of all 32 heads.
     // Next step (outside this function): multiply by W_o to project back.
 }
+
+
+// -------------------- SwiGLU Feed-Forward Network --------------------
+//
+// This is the simpler half of each transformer block.
+// It's just five steps using ops we already built.
+//
+// The expand-then-shrink pattern (2048 → 5632 → 2048) is common in
+// neural networks. The bigger intermediate space gives the network
+// more "room to think." It's like writing out your work on a big
+// whiteboard and then condensing the answer onto a notecard.
+//
+// Why SwiGLU specifically?
+//   - Old models used: out = W_down * relu(W_up * x)
+//   - SwiGLU uses:     out = W_down * (silu(W_gate * x) ⊙ (W_up * x))
+//   - The gating mechanism (⊙) lets the network learn which parts of
+//     the expanded representation to keep and which to suppress.
+//   - Empirically, models trained with SwiGLU perform better.
+
+void ffn_swiglu(float* out, const float* input,
+                float* hb, float* hb2,
+                const void* W_gate, const void* W_up, const void* W_down,
+                int n_ff, int n_embd, ggml_type type) {
+
+    // Step 1: gate = W_gate * input
+    // Expand from 2048 to 5632 through the gate projection
+    matmul(hb, W_gate, input, n_ff, n_embd, type);
+
+    // Step 2: up = W_up * input
+    // Expand from 2048 to 5632 through the up projection (different weights)
+    matmul(hb2, W_up, input, n_ff, n_embd, type);
+
+    // Step 3: Apply SiLU activation to the gate
+    // silu(x) = x * sigmoid(x)
+    // This introduces non-linearity — without it, stacking layers
+    // of matmuls would collapse into a single matmul (linear algebra).
+    silu(hb, n_ff);
+
+    // Step 4: Element-wise multiply gate and up
+    // hb = silu(gate) ⊙ up
+    // The gate controls how much of each dimension passes through.
+    // If gate[i] is close to 0 after silu, that dimension gets suppressed
+    // regardless of what up[i] contains.
+    elementwise_mul(hb, hb2, n_ff);
+
+    // Step 5: Shrink back from 5632 to 2048
+    // out = W_down * hb
+    matmul(out, W_down, hb, n_embd, n_ff, type);
+}

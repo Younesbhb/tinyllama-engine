@@ -162,3 +162,32 @@ void rope(float* q, float* k, int pos, int head_dim,
 void attention(float* out, const float* q, const float* k, const float* v,
                float* key_cache, float* value_cache, float* att,
                int layer, int pos, const llama_config_t& cfg);
+
+
+// -------------------- SwiGLU Feed-Forward Network --------------------
+// The "thinking" part of each transformer block.
+// Attention gathers context, FFN processes it.
+//
+// Flow:
+//   1. gate = matmul(W_gate, input)   [n_embd → n_ff]   (expand)
+//   2. up   = matmul(W_up,   input)   [n_embd → n_ff]   (expand)
+//   3. silu(gate)                                         (activation)
+//   4. gate = gate ⊙ up                                  (gating)
+//   5. out  = matmul(W_down, gate)    [n_ff → n_embd]   (shrink back)
+//
+// Parameters:
+//   out     - output vector [n_embd]                (result goes here)
+//   input   - input vector  [n_embd]                (normalized hidden state)
+//   hb      - scratch buffer [n_ff]                 (gate projection)
+//   hb2     - scratch buffer [n_ff]                 (up projection)
+//   W_gate  - gate weight matrix [n_ff × n_embd]   (raw bytes from GGUF)
+//   W_up    - up weight matrix   [n_ff × n_embd]   (raw bytes from GGUF)
+//   W_down  - down weight matrix [n_embd × n_ff]   (raw bytes from GGUF)
+//   n_ff    - FFN intermediate dimension (5632)
+//   n_embd  - hidden dimension (2048)
+//   type    - ggml_type of the weight matrices
+
+void ffn_swiglu(float* out, const float* input,
+                float* hb, float* hb2,
+                const void* W_gate, const void* W_up, const void* W_down,
+                int n_ff, int n_embd, ggml_type type);
