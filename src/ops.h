@@ -99,3 +99,36 @@ void elementwise_mul(float* a, const float* b, int size);
 //   size   - number of elements
 
 void vec_add(float* out, const float* x, int size);
+
+
+// -------------------- RoPE (Rotary Positional Embeddings) --------------------
+// Encodes word order by rotating Q and K vectors based on position.
+//
+// Without RoPE, "dog bites man" and "man bites dog" look the same to
+// attention because the same words produce the same Q/K vectors.
+// RoPE fixes this by rotating each vector differently based on where
+// the word appears in the sequence.
+//
+// How it works:
+//   - Groups the 64 dimensions of each head into 32 pairs
+//   - Rotates each pair by an angle that depends on:
+//     (a) the token's position in the sequence (pos)
+//     (b) which pair it is (earlier pairs rotate faster)
+//   - The rotation formula for pair i at position pos:
+//       angle = pos / (10000 ^ (2i / head_dim))
+//       new_x = x * cos(angle) - y * sin(angle)
+//       new_y = x * sin(angle) + y * cos(angle)
+//
+// Operates in-place on q and k.
+//
+// Parameters:
+//   q         - query vector  [n_embd]              (all heads concatenated)
+//   k         - key vector    [n_head_kv * head_dim] (KV heads only)
+//   pos       - position of this token in the sequence (0, 1, 2, ...)
+//   head_dim  - dimension per head (64 for TinyLlama)
+//   n_head    - number of query heads (32)
+//   n_head_kv - number of KV heads (4)
+//   freq_base - base frequency for angle calculation (10000.0)
+
+void rope(float* q, float* k, int pos, int head_dim,
+          int n_head, int n_head_kv, float freq_base);

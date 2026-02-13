@@ -248,3 +248,95 @@ void vec_add(float* out, const float* x, int size) {
         out[i] += x[i];
     }
 }
+
+
+// -------------------- RoPE (Rotary Positional Embeddings) --------------------
+//
+// Let's walk through what happens with a concrete example.
+//
+// Say we have head_dim = 64, so there are 32 pairs: (dim0,dim1), (dim2,dim3), ...
+// Say this word is at position 5 in the sequence (pos = 5).
+//
+// For pair i=0 (the fastest-rotating pair):
+//   freq = 1.0 / (10000^(0/64)) = 1.0 / 1.0 = 1.0
+//   angle = 5 * 1.0 = 5.0 radians
+//   Rotate (dim0, dim1) by 5.0 radians
+//
+// For pair i=1:
+//   freq = 1.0 / (10000^(2/64)) = 1.0 / 1.9307 = 0.518
+//   angle = 5 * 0.518 = 2.59 radians
+//   Rotate (dim2, dim3) by 2.59 radians
+//
+// For pair i=31 (the slowest-rotating pair):
+//   freq = 1.0 / (10000^(62/64)) = very small number
+//   angle = 5 * tiny = almost 0
+//   Barely rotate (dim62, dim63)
+//
+// The result: early pairs carry fine-grained position info (they rotate
+// a lot between adjacent positions), late pairs carry coarse position
+// info (they barely change). This is similar to how a clock has a fast
+// second hand and a slow hour hand — together they precisely tell time.
+//
+// We apply the SAME rotation logic to both Q and K vectors. This way,
+// when attention computes dot(Q, K), the result naturally depends on
+// the relative distance between the two tokens.
+
+void rope(float* q, float* k, int pos, int head_dim,
+          int n_head, int n_head_kv, float freq_base) {
+
+    // Number of pairs per head (each pair = 2 dimensions)
+    int n_pairs = head_dim / 2;
+
+    // Rotate all query heads
+    for (int h = 0; h < n_head; h++) {
+        // Pointer to this head's slice of the q vector
+        // Head 0 starts at q[0], head 1 at q[64], head 2 at q[128], etc.
+        float* head_q = q + h * head_dim;
+
+        for (int i = 0; i < n_pairs; i++) {
+            // Compute the rotation angle for this pair at this position
+            //
+            // freq = 1 / (10000 ^ (2i / head_dim))
+            // angle = pos * freq
+            //
+            // The pow() computes 10000^(2i/64). For i=0 this is 1.0,
+            // for i=31 this is nearly 10000. So early pairs rotate
+            // fast and late pairs rotate slow.
+            float freq = 1.0f / std::pow(freq_base,
+                                         static_cast<float>(2 * i) / static_cast<float>(head_dim));
+            float angle = static_cast<float>(pos) * freq;
+
+            // Precompute cos and sin (used for the 2D rotation)
+            float cos_a = std::cos(angle);
+            float sin_a = std::sin(angle);
+
+            // The two elements of this pair
+            float x0 = head_q[2 * i];      // "x coordinate"
+            float x1 = head_q[2 * i + 1];  // "y coordinate"
+
+            // Apply 2D rotation
+            head_q[2 * i]     = x0 * cos_a - x1 * sin_a;
+            head_q[2 * i + 1] = x0 * sin_a + x1 * cos_a;
+        }
+    }
+
+    // Rotate all KV heads (same logic, fewer heads)
+    for (int h = 0; h < n_head_kv; h++) {
+        float* head_k = k + h * head_dim;
+
+        for (int i = 0; i < n_pairs; i++) {
+            float freq = 1.0f / std::pow(freq_base,
+                                         static_cast<float>(2 * i) / static_cast<float>(head_dim));
+            float angle = static_cast<float>(pos) * freq;
+
+            float cos_a = std::cos(angle);
+            float sin_a = std::sin(angle);
+
+            float x0 = head_k[2 * i];
+            float x1 = head_k[2 * i + 1];
+
+            head_k[2 * i]     = x0 * cos_a - x1 * sin_a;
+            head_k[2 * i + 1] = x0 * sin_a + x1 * cos_a;
+        }
+    }
+}

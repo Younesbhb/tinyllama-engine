@@ -211,6 +211,121 @@ void test_vec_add() {
           approx_equal(out[2], 33.0f));
 }
 
+void test_rope() {
+    std::cout << "\n=== rope ===\n";
+
+    // TinyLlama dimensions
+    const int head_dim = 64;
+    const int n_head = 32;
+    const int n_head_kv = 4;
+    const float freq_base = 10000.0f;
+
+    // --- Test 1: Position 0 should not change anything ---
+    // Rotating by angle 0 means cos(0)=1, sin(0)=0
+    // So new_x = x*1 - y*0 = x, new_y = x*0 + y*1 = y (unchanged)
+    {
+        // Fill q with known values
+        std::vector<float> q(n_head * head_dim, 1.0f);
+        std::vector<float> k(n_head_kv * head_dim, 1.0f);
+        std::vector<float> q_orig = q;
+        std::vector<float> k_orig = k;
+
+        rope(q.data(), k.data(), 0, head_dim, n_head, n_head_kv, freq_base);
+
+        bool q_unchanged = true, k_unchanged = true;
+        for (size_t i = 0; i < q.size(); i++) {
+            if (!approx_equal(q[i], q_orig[i])) { q_unchanged = false; break; }
+        }
+        for (size_t i = 0; i < k.size(); i++) {
+            if (!approx_equal(k[i], k_orig[i])) { k_unchanged = false; break; }
+        }
+        check("position 0: Q unchanged", q_unchanged);
+        check("position 0: K unchanged", k_unchanged);
+    }
+
+    // --- Test 2: Rotation preserves vector length ---
+    // A 2D rotation never stretches or shrinks a vector.
+    // So the length (norm) of each head should be the same before and after.
+    {
+        std::vector<float> q(n_head * head_dim);
+        std::vector<float> k(n_head_kv * head_dim);
+        // Fill with varied values
+        for (int i = 0; i < n_head * head_dim; i++) q[i] = static_cast<float>(i % 7) - 3.0f;
+        for (int i = 0; i < n_head_kv * head_dim; i++) k[i] = static_cast<float>(i % 5) - 2.0f;
+
+        // Compute norm of head 0 before
+        float norm_before = 0.0f;
+        for (int i = 0; i < head_dim; i++) norm_before += q[i] * q[i];
+        norm_before = std::sqrt(norm_before);
+
+        rope(q.data(), k.data(), 42, head_dim, n_head, n_head_kv, freq_base);
+
+        // Compute norm of head 0 after
+        float norm_after = 0.0f;
+        for (int i = 0; i < head_dim; i++) norm_after += q[i] * q[i];
+        norm_after = std::sqrt(norm_after);
+
+        check("rotation preserves vector length", approx_equal(norm_before, norm_after, 1e-3f));
+    }
+
+    // --- Test 3: Different positions give different results ---
+    {
+        std::vector<float> q1(n_head * head_dim, 1.0f);
+        std::vector<float> k1(n_head_kv * head_dim, 1.0f);
+        std::vector<float> q2(n_head * head_dim, 1.0f);
+        std::vector<float> k2(n_head_kv * head_dim, 1.0f);
+
+        rope(q1.data(), k1.data(), 5, head_dim, n_head, n_head_kv, freq_base);
+        rope(q2.data(), k2.data(), 100, head_dim, n_head, n_head_kv, freq_base);
+
+        bool different = false;
+        for (int i = 0; i < head_dim; i++) {
+            if (!approx_equal(q1[i], q2[i])) { different = true; break; }
+        }
+        check("position 5 vs 100 gives different Q", different);
+    }
+
+    // --- Test 4: Same position gives same result (deterministic) ---
+    {
+        std::vector<float> q1(n_head * head_dim, 2.5f);
+        std::vector<float> k1(n_head_kv * head_dim, 2.5f);
+        std::vector<float> q2(n_head * head_dim, 2.5f);
+        std::vector<float> k2(n_head_kv * head_dim, 2.5f);
+
+        rope(q1.data(), k1.data(), 17, head_dim, n_head, n_head_kv, freq_base);
+        rope(q2.data(), k2.data(), 17, head_dim, n_head, n_head_kv, freq_base);
+
+        bool same = true;
+        for (size_t i = 0; i < q1.size(); i++) {
+            if (!approx_equal(q1[i], q2[i])) { same = false; break; }
+        }
+        check("same position gives identical result", same);
+    }
+
+    // --- Test 5: Manual check on a single pair ---
+    // For head 0, pair 0, position 1:
+    //   freq = 1.0 / (10000^(0/64)) = 1.0
+    //   angle = 1 * 1.0 = 1.0 radian
+    //   q[0] = 3.0 * cos(1) - 4.0 * sin(1)
+    //   q[1] = 3.0 * sin(1) + 4.0 * cos(1)
+    {
+        std::vector<float> q(n_head * head_dim, 0.0f);
+        std::vector<float> k(n_head_kv * head_dim, 0.0f);
+        q[0] = 3.0f;
+        q[1] = 4.0f;
+
+        rope(q.data(), k.data(), 1, head_dim, n_head, n_head_kv, freq_base);
+
+        float expected_0 = 3.0f * std::cos(1.0f) - 4.0f * std::sin(1.0f);
+        float expected_1 = 3.0f * std::sin(1.0f) + 4.0f * std::cos(1.0f);
+
+        std::cout << "    manual check: q[0]=" << q[0] << " expected=" << expected_0 << "\n";
+        std::cout << "    manual check: q[1]=" << q[1] << " expected=" << expected_1 << "\n";
+        check("manual rotation q[0]", approx_equal(q[0], expected_0));
+        check("manual rotation q[1]", approx_equal(q[1], expected_1));
+    }
+}
+
 void test_matmul_realistic_size() {
     std::cout << "\n=== matmul at realistic dimensions ===\n";
 
@@ -259,6 +374,7 @@ int main() {
     test_silu();
     test_elementwise_mul();
     test_vec_add();
+    test_rope();
     test_matmul_realistic_size();
 
     std::cout << "\n============================\n";
