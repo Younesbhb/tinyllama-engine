@@ -132,3 +132,33 @@ void vec_add(float* out, const float* x, int size);
 
 void rope(float* q, float* k, int pos, int head_dim,
           int n_head, int n_head_kv, float freq_base);
+
+
+// -------------------- Multi-Head GQA Attention --------------------
+// The core mechanism that lets the model "look back" at previous tokens.
+//
+// What happens:
+//   1. Store current token's k and v into the KV cache
+//   2. For each query head:
+//      a. Find which KV head it shares (GQA: every 8 query heads share 1 KV head)
+//      b. Compute dot product of q against all cached keys → scores
+//      c. Scale scores by 1/sqrt(head_dim) to prevent overflow
+//      d. Softmax → attention weights (percentages)
+//      e. Weighted sum of cached values → this head's output (64 floats)
+//   3. All 32 heads' outputs are concatenated → 2048 floats
+//
+// Parameters:
+//   out         - output vector [n_embd]  (all heads concatenated)
+//   q           - query vector  [n_embd]  (already rotated by RoPE)
+//   k           - key vector    [kv_dim]  (already rotated by RoPE)
+//   v           - value vector  [kv_dim]
+//   key_cache   - cached keys   [n_layers * n_ctx * kv_dim]
+//   value_cache - cached values [n_layers * n_ctx * kv_dim]
+//   att         - scratch buffer for attention scores [n_ctx]
+//   layer       - which layer (0-21), for indexing into KV cache
+//   pos         - current token position
+//   cfg         - model config (dimensions, head counts, etc.)
+
+void attention(float* out, const float* q, const float* k, const float* v,
+               float* key_cache, float* value_cache, float* att,
+               int layer, int pos, const llama_config_t& cfg);

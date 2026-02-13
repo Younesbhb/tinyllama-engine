@@ -4,6 +4,7 @@
 #include <vector>
 #include <iostream>
 #include <iomanip>
+#include <algorithm>
 
 #include "ops.h"
 #include "gguf.h"
@@ -211,6 +212,144 @@ void test_vec_add() {
           approx_equal(out[2], 33.0f));
 }
 
+void test_attention() {
+    std::cout << "\n=== attention ===\n";
+
+    // Use TinyLlama dimensions
+    llama_config_t cfg;
+    cfg.n_layers = 2;       // just 2 layers for testing
+    cfg.n_embd = 2048;
+    cfg.n_head = 32;
+    cfg.n_head_kv = 4;
+    cfg.n_ff = 5632;
+    cfg.n_vocab = 32000;
+    cfg.n_ctx = 64;         // small context for testing
+
+    int head_dim = static_cast<int>(cfg.head_dim());  // 64
+    int kv_dim = cfg.n_head_kv * head_dim;             // 256
+    int n_embd = static_cast<int>(cfg.n_embd);         // 2048
+
+    // Allocate buffers
+    std::vector<float> out(n_embd, 0.0f);
+    std::vector<float> q(n_embd, 0.0f);
+    std::vector<float> k(kv_dim, 0.0f);
+    std::vector<float> v(kv_dim, 0.0f);
+    std::vector<float> att(cfg.n_ctx, 0.0f);
+
+    size_t cache_size = cfg.n_layers * cfg.n_ctx * kv_dim;
+    std::vector<float> key_cache(cache_size, 0.0f);
+    std::vector<float> value_cache(cache_size, 0.0f);
+
+    // --- Test 1: Single token (pos=0) → attention to self must be 100% ---
+    // When there's only one token, softmax over a single element = 1.0
+    // So the output should be exactly the value vector.
+    {
+        // Set q to some values
+        for (int i = 0; i < n_embd; i++) q[i] = 1.0f;
+        // Set k to some values
+        for (int i = 0; i < kv_dim; i++) k[i] = 1.0f;
+        // Set v to a recognizable pattern: v[i] = i for each head
+        for (int i = 0; i < kv_dim; i++) v[i] = static_cast<float>(i % head_dim);
+
+        attention(out.data(), q.data(), k.data(), v.data(),
+                  key_cache.data(), value_cache.data(), att.data(),
+                  0, 0, cfg);
+
+        // Head 0 should output exactly v[0..63] since it's the only token
+        // Head 0 uses KV head 0, and v for KV head 0 is v[0..63]
+        bool self_attention_ok = true;
+        for (int d = 0; d < head_dim; d++) {
+            float expected = static_cast<float>(d);  // v[d] = d
+            if (!approx_equal(out[d], expected, 1e-3f)) {
+                self_attention_ok = false;
+                std::cout << "    mismatch at d=" << d << ": got " << out[d]
+                          << " expected " << expected << "\n";
+                break;
+            }
+        }
+        check("single token: output = value (100% self-attention)", self_attention_ok);
+    }
+
+    // --- Test 2: Two tokens with identical keys → uniform attention (50/50) ---
+    {
+        // Reset caches
+        std::fill(key_cache.begin(), key_cache.end(), 0.0f);
+        std::fill(value_cache.begin(), value_cache.end(), 0.0f);
+
+        // Token 0: v = all 1.0
+        for (int i = 0; i < kv_dim; i++) { k[i] = 1.0f; v[i] = 1.0f; }
+        for (int i = 0; i < n_embd; i++) q[i] = 1.0f;
+        attention(out.data(), q.data(), k.data(), v.data(),
+                  key_cache.data(), value_cache.data(), att.data(),
+                  0, 0, cfg);
+
+        // Token 1: same k (so scores are equal), v = all 3.0
+        for (int i = 0; i < kv_dim; i++) { k[i] = 1.0f; v[i] = 3.0f; }
+        for (int i = 0; i < n_embd; i++) q[i] = 1.0f;
+        attention(out.data(), q.data(), k.data(), v.data(),
+                  key_cache.data(), value_cache.data(), att.data(),
+                  0, 1, cfg);
+
+        // With equal keys, attention is 50/50
+        // Output should be 0.5 * 1.0 + 0.5 * 3.0 = 2.0 for head 0
+        check("uniform attention: 50/50 blend → 2.0", approx_equal(out[0], 2.0f, 0.01f));
+    }
+
+    // --- Test 3: Output has no NaN or Inf ---
+    {
+        std::fill(key_cache.begin(), key_cache.end(), 0.0f);
+        std::fill(value_cache.begin(), value_cache.end(), 0.0f);
+
+        // Process 10 tokens with varied values
+        for (int p = 0; p < 10; p++) {
+            for (int i = 0; i < n_embd; i++) q[i] = static_cast<float>((i + p) % 11) - 5.0f;
+            for (int i = 0; i < kv_dim; i++) {
+                k[i] = static_cast<float>((i + p * 3) % 7) - 3.0f;
+                v[i] = static_cast<float>((i + p * 5) % 9) - 4.0f;
+            }
+            attention(out.data(), q.data(), k.data(), v.data(),
+                      key_cache.data(), value_cache.data(), att.data(),
+                      0, p, cfg);
+        }
+
+        bool no_nan = true;
+        for (int i = 0; i < n_embd; i++) {
+            if (std::isnan(out[i]) || std::isinf(out[i])) { no_nan = false; break; }
+        }
+        check("10 tokens: no NaN/Inf in output", no_nan);
+    }
+
+    // --- Test 4: GQA head mapping works correctly ---
+    // Verify that query heads 0 and 8 use different KV heads
+    // when KV heads have different values
+    {
+        std::fill(key_cache.begin(), key_cache.end(), 0.0f);
+        std::fill(value_cache.begin(), value_cache.end(), 0.0f);
+
+        // Set up k with same values across all KV heads (equal scores)
+        for (int i = 0; i < kv_dim; i++) k[i] = 1.0f;
+        for (int i = 0; i < n_embd; i++) q[i] = 1.0f;
+
+        // But set v so KV head 0 = all 10.0, KV head 1 = all 20.0
+        for (int i = 0; i < kv_dim; i++) v[i] = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            v[0 * head_dim + d] = 10.0f;   // KV head 0
+            v[1 * head_dim + d] = 20.0f;   // KV head 1
+        }
+
+        attention(out.data(), q.data(), k.data(), v.data(),
+                  key_cache.data(), value_cache.data(), att.data(),
+                  0, 0, cfg);
+
+        // Query head 0 uses KV head 0 → output should be 10.0
+        // Query head 8 uses KV head 1 → output should be 20.0
+        float head0_val = out[0];                    // first dim of query head 0
+        float head8_val = out[8 * head_dim];         // first dim of query head 8
+        check("GQA: head 0 uses KV head 0 (val=10)", approx_equal(head0_val, 10.0f, 0.01f));
+        check("GQA: head 8 uses KV head 1 (val=20)", approx_equal(head8_val, 20.0f, 0.01f));
+    }
+}
+
 void test_rope() {
     std::cout << "\n=== rope ===\n";
 
@@ -374,6 +513,7 @@ int main() {
     test_silu();
     test_elementwise_mul();
     test_vec_add();
+    test_attention();
     test_rope();
     test_matmul_realistic_size();
 
