@@ -191,3 +191,46 @@ void ffn_swiglu(float* out, const float* input,
                 float* hb, float* hb2,
                 const void* W_gate, const void* W_up, const void* W_down,
                 int n_ff, int n_embd, ggml_type type);
+
+
+// -------------------- Sampling --------------------
+// After the forward pass produces 32,000 logit scores, we need to
+// pick one token. These functions implement different strategies.
+
+
+// Argmax (Greedy): Just pick the token with the highest logit.
+// Simple and deterministic, but produces repetitive, boring text.
+// Good for factual/coding tasks where you want the "most likely" answer.
+//
+// Returns the token ID with the highest score.
+
+int sample_argmax(const float* logits, int n_vocab);
+
+
+// Temperature + Random Sampling:
+// 1. Divide all logits by temperature (controls randomness)
+//    - temp < 1.0: sharper distribution (more confident, less creative)
+//    - temp = 1.0: unchanged
+//    - temp > 1.0: flatter distribution (more random, more creative)
+// 2. Apply softmax to get probabilities
+// 3. Randomly pick a token weighted by those probabilities
+//
+// Returns a sampled token ID.
+
+int sample_temperature(float* logits, int n_vocab, float temperature);
+
+
+// Top-P (Nucleus) Sampling:
+// 1. Apply temperature scaling
+// 2. Sort tokens by probability (highest first)
+// 3. Keep only tokens whose cumulative probability reaches p (e.g. 0.9)
+//    This means: if the top 5 tokens already cover 90% probability,
+//    ignore the other 31,995 tokens entirely
+// 4. Randomly sample from this reduced set
+//
+// This gives better quality than pure random sampling because it
+// cuts off the long tail of unlikely tokens that would produce garbage.
+//
+// Returns a sampled token ID.
+
+int sample_top_p(float* logits, int n_vocab, float temperature, float top_p);

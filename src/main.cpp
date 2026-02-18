@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cerrno>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -20,7 +21,44 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <iomanip> // for precision output
-#include <cmath>
+
+// Some definitions
+// n_embd (2048) — The "width" of the model. Every token gets represented as 2,048 numbers. 
+// This vector flows through the entire model.
+
+// n_layers (22) — How many times the token gets processed. Each layer refines the representation.
+
+// n_ff (5632): "feed-forward dimension." The FFN temporarily expands from 2048 to 5632 (bigger workspace to "think" in), then shrinks back.
+
+// n_ctx (2048): "context length." Maximum number of tokens the model can see at once — prompt plus generated text combined.
+
+// n_vocab (32000): "vocabulary size." How many words/tokens the model knows.
+
+// n_layers (22): How many transformer blocks the signal passes through.
+
+// kv_dim (256) — The size of the key and value vectors. Smaller than 2048 because of 
+// GQA (4 KV heads × 64 dimensions per head = 256 instead of 32 × 64 = 2048).
+
+// Input embedding matrix (token_embd.weight): Size 32,000 × 2,048. Used at the very start of the forward pass. Converts a token ID into a 2,048-number vector. Row 15043 is the vector for "Hello." We used this in embed_token().
+
+// Output matrix (output.weight): Size 32,000 × 2,048. Used at the very end. Converts the final 2,048-number hidden state into 32,000 scores — one per vocabulary word.
+
+// n_head (32): The number of query heads. The model runs attention 32 times in parallel, each focusing on different aspects of the input. One head might focus on grammar, another on meaning, another on nearby words, etc.
+
+// n_head_kv (4): The number of key/value heads. Instead of each query head having its own key and value (which would need 32 KV heads), multiple query heads share KV heads. 32 query heads share 4 KV heads — that's 8 query heads per KV head. This saves memory.
+
+// kv_dim (256): The total size of the key and value vectors. It's n_head_kv × head_dim = 4 × 64 = 256. This isn't stored in the config — we compute it in the forward pass because it's derived from other values.
+
+// head_dim (64): The size of each head's vector. It's calculated as n_embd / n_head = 2048 / 32 = 64. Each head works on a 64-dimensional slice. All 32 heads together: 32 × 64 = 2048 (the full hidden state).
+
+// What is normalizing?
+// Imagine you have the numbers [1000, 2000, 3000]. After multiplying through several layers, they might become [5000000, 10000000, 15000000]. After a few more layers, they could overflow to infinity.
+// Normalizing scales them back to a reasonable range. RMSNorm takes those giant numbers and rescales them so the average magnitude is around 1.0:
+//
+//Do we have a KV cache for each layer? A query cache?
+// KV cache: yes, one per layer. The cache stores keys and values for all 22 layers, each with space for 2048 positions × 256 floats.
+// Query cache: no. Queries are never cached. A query is only used once — at the moment the token is processed — to compute attention scores against all cached keys. After that, the query is thrown away.
+
 // -------------------- small helpers --------------------
 
 static std::string sys_err(const char* what) {
@@ -51,10 +89,10 @@ static std::uint64_t bytes_per_element(ggml_type t) {
 }
 
 // -------------------- mmap RAII --------------------
-// “RAII” means cleanup happens automatically.
+// "RAII" means cleanup happens automatically.
 
 struct MMapFile {
-    //file descriptor (Linux/macOS “file handle”). -1 means “not opened”.
+    //file descriptor (Linux/macOS "file handle"). -1 means "not opened".
     int fd = -1;
     //base: pointer to the start of the mapped file in memory.
     std::uint8_t* base = nullptr;
@@ -66,7 +104,7 @@ struct MMapFile {
         
         //path.c_str() converts a C++ std::string into a C-style string (const char*)
         //O_RDONLY = open for reading only.
-        //if it fails → throw error.
+        //if it fails -> throw error.
         //fd is just an ID number that the operating system uses to look up the real file information inside the kernel.
         fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) throw std::runtime_error(sys_err("open"));
@@ -75,11 +113,11 @@ struct MMapFile {
 
         /*
         fstat fills st with info about the file (including size).
-        If error or size 0 → close file and throw.
+        If error or size 0 -> close file and throw.
         */
-        // “Using this file descriptor fd, fill st with info about the file.”
+        // "Using this file descriptor fd, fill st with info about the file."
         //stat is a struct the OS uses to return file info (size, permissions, etc.).
-        //“Hey OS, look up the file associated with descriptor fd and copy its info into st.”
+        //"Hey OS, look up the file associated with descriptor fd and copy its info into st."
         struct stat st{};
         if (::fstat(fd, &st) != 0) {
             ::close(fd);
@@ -97,13 +135,13 @@ struct MMapFile {
         nullptr = OS chooses where to map it.
         size = map whole file
         PROT_READ = read-only memory
-        MAP_PRIVATE = changes (if any) won’t write back to disk
+        MAP_PRIVATE = changes (if any) won't write back to disk
         fd = which file
         0 = AKA Offset into the file (0 means start at beginning).
         */
         void* p = ::mmap(nullptr, static_cast<size_t>(size), PROT_READ, MAP_PRIVATE, fd, 0);
         
-        //If mapping fails → close fd and throw.
+        //If mapping fails -> close fd and throw.
         if (p == MAP_FAILED) {
             ::close(fd);
             throw std::runtime_error(sys_err("mmap"));
@@ -117,9 +155,9 @@ struct MMapFile {
     }
 
 
-    //“This object cannot be copied.”
-    //= delete means “this operation is forbidden”
-    //“The copy constructor does not exist.”
+    //"This object cannot be copied."
+    //= delete means "this operation is forbidden"
+    //"The copy constructor does not exist."
     MMapFile(const MMapFile&) = delete;
     MMapFile& operator=(const MMapFile&) = delete;
 
@@ -308,7 +346,7 @@ public:
         parse();
     }
 
-    // const here means calling this function will NOT modify the object.”
+    // const here means calling this function will NOT modify the object.
     std::uint32_t version() const { return version_; }
     std::uint64_t n_tensors() const { return n_tensors_; }
     std::uint64_t n_kv() const { return n_kv_; }
@@ -628,30 +666,24 @@ private:
     }
 };
 
-// -------------------- Helper: Embedding Lookup --------------------
-//
-// The embedding table is a big matrix: [32000 × 2048]
-// Each row is one token's "meaning" as a vector of 2048 numbers.
-// This function copies row `token` into the output buffer,
-// converting from F16 to F32 if needed.
-//
-// This is NOT a matmul — it's just a table lookup. No math,
-// just "give me the 2048 numbers for token #15043."
+// -------------------- Forward Pass Helpers --------------------
 
+
+// embed_token(out, model, token) — Goes to the embedding table (a big grid of 32,000 rows × 2,048 columns stored in the model file) and 
+// copies row number 'token' into 'out'. If token is 15043, it copies the 15,043rd row — 2,048 numbers that represent what "Hello" means to the model.
+// These numbers were learned during training.
 static void embed_token(float* out, const GGUFModel& model, int token) {
     const auto& t = model.tensor_info("token_embd.weight");
     const std::uint8_t* data = model.tensor_bytes(t);
     int n_embd = static_cast<int>(model.config().n_embd);
 
     if (t.type == GGML_TYPE_F16) {
-        // F16: each weight is 2 bytes, need to convert to F32
         const std::uint16_t* emb = reinterpret_cast<const std::uint16_t*>(data);
         const std::uint16_t* row = emb + static_cast<std::size_t>(token) * n_embd;
         for (int i = 0; i < n_embd; i++) {
             out[i] = fp16_to_f32(row[i]);
         }
     } else if (t.type == GGML_TYPE_F32) {
-        // F32: each weight is 4 bytes, can copy directly
         const float* emb = reinterpret_cast<const float*>(data);
         const float* row = emb + static_cast<std::size_t>(token) * n_embd;
         for (int i = 0; i < n_embd; i++) {
@@ -662,14 +694,8 @@ static void embed_token(float* out, const GGUFModel& model, int token) {
     }
 }
 
-
-// -------------------- Helper: Get Norm Weights --------------------
-//
-// RMSNorm weights are small 1D vectors (2048 floats = 8KB).
-// They're always stored as F32 even in F16 models because:
-//   - They're tiny (no memory savings from quantizing)
-//   - Precision matters for normalization stability
-
+// Looks up a small array of 2,048 numbers from the model file by name. 
+// These are the learned weights for RMSNorm 
 static const float* get_norm_weight(const GGUFModel& model, const std::string& name) {
     const auto& t = model.tensor_info(name);
     if (t.type != GGML_TYPE_F32) {
@@ -678,149 +704,78 @@ static const float* get_norm_weight(const GGUFModel& model, const std::string& n
     return reinterpret_cast<const float*>(model.tensor_bytes(t));
 }
 
-
-// -------------------- Helper: Get Weight Pointer + Type --------------------
-//
-// For matmul, we need both the raw pointer and the type
-// (so matmul knows whether to use F16 or F32 path).
-
 struct WeightRef {
     const void* data;
     ggml_type type;
 };
 
+// Looks up a weight matrix from the model file by name. 
+// Returns both the pointer to the data and what format it's in (F16 or F32), 
+// so matmul knows how to read it.
 static WeightRef get_weight(const GGUFModel& model, const std::string& name) {
     const auto& t = model.tensor_info(name);
     return { model.tensor_bytes(t), t.type };
 }
 
-
-// -------------------- The Forward Pass --------------------
-//
-// This is where everything comes together. One call to this function
-// processes a single token through the entire model.
-//
-// Input:  a token ID (like 15043 for "Hello") and its position
-// Output: state.logits filled with 32000 scores (one per vocab word)
-//
-// The flow:
-//
-//   Token ID ─── embed_token ───► x [2048]
-//                                  │
-//        ┌─────────────────────────┤  (repeat 22 times)
-//        │                         ▼
-//        │              rmsnorm ──► xb [2048]
-//        │                         │
-//        │              matmul(W_q, xb) ──► q  [2048]
-//        │              matmul(W_k, xb) ──► k  [256]
-//        │              matmul(W_v, xb) ──► v  [256]
-//        │                         │
-//        │              rope(q, k, pos)
-//        │                         │
-//        │              attention ──► xb2 [2048]
-//        │                         │
-//        │              matmul(W_o, xb2) ──► xb [2048]
-//        │                         │
-//        │              x = x + xb  (residual)
-//        │                         │
-//        │              rmsnorm ──► xb [2048]
-//        │                         │
-//        │              ffn_swiglu ──► xb2 [2048]
-//        │                         │
-//        │              x = x + xb2 (residual)
-//        │                         │
-//        └─────────────────────────┘
-//                                  │
-//                       rmsnorm ──► x [2048]  (final norm, in-place)
-//                                  │
-//                       matmul(W_out, x) ──► logits [32000]
-//
+// -------------------- Forward Pass --------------------
+// model — The model file. Contains all the weight matrices (the "knowledge" the model learned during training). Read-only, never changes.
+// state — Scratch space. Contains temporary buffers (x, xb, q, k, v, etc.) and the KV cache. Gets overwritten every call.
+// token — The token ID to process (like 15043 for "Hello").
+// pos — Where this token sits in the sequence (0, 1, 2, ...). Used by RoPE to encode word order.
 
 static void forward(GGUFModel& model, RunState& state, int token, int pos) {
     const auto& cfg = model.config();
-    int n_embd  = static_cast<int>(cfg.n_embd);
+    int n_embd   = static_cast<int>(cfg.n_embd);
     int n_layers = static_cast<int>(cfg.n_layers);
-    int n_ff    = static_cast<int>(cfg.n_ff);
-    int kv_dim  = static_cast<int>(cfg.n_head_kv * cfg.head_dim());
+    int n_ff     = static_cast<int>(cfg.n_ff);
+    int kv_dim   = static_cast<int>(cfg.n_head_kv * cfg.head_dim());
 
-
-    // ============================================================
-    // Step 1: Embedding Lookup
-    // ============================================================
-    // Convert token ID → 2048-dimensional vector.
-    // "Hello" (ID 15043) → [0.023, -0.841, 0.127, ..., 0.445]
-    //
-    // This is the starting point. These 2048 numbers are the model's
-    // initial "understanding" of this word, before any context.
-
+    // Convert the token ID into a vector of 2,048 numbers
     embed_token(state.x, model, token);
 
-
-    // ============================================================
-    // Step 2: Transformer Layers (the main loop)
-    // ============================================================
-    // Each layer refines the representation.
-    // After 22 layers of refinement, x contains enough information
-    // to predict the next word.
-
+    // Run for 22 layers
     for (int l = 0; l < n_layers; l++) {
-
-        // Build tensor name prefix for this layer: "blk.0.", "blk.1.", etc.
         std::string prefix = "blk." + std::to_string(l) + ".";
 
-
-        // ---- ATTENTION HALF ----
-
-        // RMSNorm: normalize x before attention.
-        // Result goes to xb (we need original x for the residual later).
         const float* attn_norm_w = get_norm_weight(model, prefix + "attn_norm.weight");
         rmsnorm(state.xb, state.x, attn_norm_w, n_embd, cfg.rms_norm_eps);
 
-        // Q, K, V projections: multiply normalized input by weight matrices.
-        // This creates the query ("what am I looking for?"),
-        // key ("what do I contain?"), and value ("here's my content")
-        // for this token.
         auto wq = get_weight(model, prefix + "attn_q.weight");
         auto wk = get_weight(model, prefix + "attn_k.weight");
         auto wv = get_weight(model, prefix + "attn_v.weight");
 
-        matmul(state.q, wq.data, state.xb, n_embd, n_embd, wq.type);
-        matmul(state.k, wk.data, state.xb, kv_dim,  n_embd, wk.type);
-        matmul(state.v, wv.data, state.xb, kv_dim,  n_embd, wv.type);
+        matmul(state.q, wq.data, state.xb, n_embd, n_embd, wq.type);    // fills state.q
+        matmul(state.k, wk.data, state.xb, kv_dim,  n_embd, wk.type);   // fills state.k
+        matmul(state.v, wv.data, state.xb, kv_dim,  n_embd, wv.type);   // fills state.v
 
-        // RoPE: rotate Q and K to encode position information.
-        // Without this, "dog bites man" and "man bites dog" look the same.
         rope(state.q, state.k, pos,
              static_cast<int>(cfg.head_dim()),
              static_cast<int>(cfg.n_head),
              static_cast<int>(cfg.n_head_kv),
              cfg.rope_freq_base);
 
-        // Attention: look back at all previous tokens, compute relevance
-        // scores, and blend their values. Result → xb2
+        // Stores this token's key and value into the KV cache at position pos in layer l
+        // Compares this token's query against every previous token's cached key (dot product)
+        // to compute relevance scores.
+        // Converts scores to percentages with softmax
+        // Blends the cached values using those percentages
+        // The result goes into state.xb2 — 2,048 numbers representing "what I learned by looking at all previous tokens."
+        // state.att is scratch space the attention function uses internally for the scores.
+
         attention(state.xb2, state.q, state.k, state.v,
                   state.key_cache, state.value_cache, state.att,
                   l, pos, cfg);
 
-        // Output projection: convert attention output back to hidden dimension.
-        // Result → xb (we're done with the old xb from rmsnorm)
         auto wo = get_weight(model, prefix + "attn_output.weight");
         matmul(state.xb, wo.data, state.xb2, n_embd, n_embd, wo.type);
 
-        // Residual connection: add attention's contribution to original signal.
-        // x = x + attention_output
-        // The original x passes through unchanged; attention just adds to it.
         vec_add(state.x, state.xb, n_embd);
 
+        // --------------------- FFN (thinking) ---------------------
 
-        // ---- FFN HALF ----
-
-        // RMSNorm: normalize x before FFN.
         const float* ffn_norm_w = get_norm_weight(model, prefix + "ffn_norm.weight");
         rmsnorm(state.xb, state.x, ffn_norm_w, n_embd, cfg.rms_norm_eps);
 
-        // SwiGLU FFN: expand to 5632 dims, process, shrink back to 2048.
-        // This is the "thinking" step. Result → xb2
         auto wgate = get_weight(model, prefix + "ffn_gate.weight");
         auto wup   = get_weight(model, prefix + "ffn_up.weight");
         auto wdown = get_weight(model, prefix + "ffn_down.weight");
@@ -830,57 +785,144 @@ static void forward(GGUFModel& model, RunState& state, int token, int pos) {
                    wgate.data, wup.data, wdown.data,
                    n_ff, n_embd, wgate.type);
 
-        // Residual connection: add FFN's contribution.
-        // x = x + ffn_output
         vec_add(state.x, state.xb2, n_embd);
     }
+    // After the loop ends, state.x holds the model's full understanding — 2048 numbers encoding everything the model knows about what should come next. But these numbers are in the model's "internal language" — they're meaningful to the model's math but not to us.   
+    // After the forward function ends, state.logits holds 32000 human-interpretable scores — one per word in the vocabulary. "the" gets 2.1, "on" gets 8.7, "quietly" gets 5.3, etc.
+    // The final norm + matmul is just a translation step. It converts the 2048-number internal representation into 32000 concrete word predictions. 
+    // state.x doesn't change in a meaningful way after the loop — it just gets normalized (cleaned up) and then multiplied by the output matrix to produce state.logits. The "thinking" is done. The last step is just reading out the answer.
 
-
-    // ============================================================
-    // Step 3: Final RMSNorm
-    // ============================================================
-    // One last normalization before projecting to vocabulary.
-    // This is in-place: x gets normalized directly (no need to
-    // preserve the old x since there are no more residual connections).
-
+    // ---- Final Output: Convert hidden state to word predictions ----
+    // All 22 layers are done. state.x now holds the final refined 2048-number
+    // representation of the current token, enriched with context from all 
+    // previous tokens. 
+    // 
+    // We normalize one last time, then multiply by the output matrix 
+    // (32000 × 2048) to produce 32000 scores (logits) — one per word 
+    // in the vocabulary. The highest score = the model's best guess 
+    // for the next word.
+    //
+    // TinyLlama uses "tied embeddings": no separate output.weight exists,
+    // so we reuse token_embd.weight (the same matrix used to convert 
+    // token IDs to vectors at the start).
     const float* final_norm_w = get_norm_weight(model, "output_norm.weight");
     rmsnorm(state.x, state.x, final_norm_w, n_embd, cfg.rms_norm_eps);
-
-
-    // ============================================================
-    // Step 4: Project to Vocabulary → Logits
-    // ============================================================
-    // Multiply the 2048-dim hidden state by a [32000 × 2048] matrix
-    // to get one score per vocabulary word.
-    //
-    // TinyLlama uses "tied embeddings": the output matrix is the SAME
-    // as the input embedding matrix. Instead of storing two 32000×2048
-    // matrices, it reuses one. We check if "output.weight" exists;
-    // if not, we fall back to "token_embd.weight".
-    //
-    // After this, state.logits[i] = how likely token i is to be next.
-    // High logit = likely. Low logit = unlikely.
 
     WeightRef w_out;
     bool found_output = false;
     try {
         w_out = get_weight(model, "output.weight");
         found_output = true;
-    } catch (...) {
-        // Tied embeddings: reuse token embedding weights
-    }
+    } catch (...) {}
     if (!found_output) {
         w_out = get_weight(model, "token_embd.weight");
     }
 
+    // By the end, state.x contains the original embedding plus 22 attention contributions plus 22 FFN contributions. 
+    // Every layer's work is preserved in that sum.
     matmul(state.logits, w_out.data, state.x,
            static_cast<int>(cfg.n_vocab), n_embd, w_out.type);
-
-    // state.logits now contains 32000 scores.
-    // To get the next token: apply softmax, then sample.
 }
 
 
+// -------------------- Generation Loop --------------------
+//
+// This is where the engine comes alive. The loop:
+//   1. Encode the prompt into token IDs
+//   2. Prepend BOS token
+//   3. Run forward pass for each prompt token (fills KV cache)
+//   4. Sample next token from the logits
+//   5. Feed that token back in, run forward again
+//   6. Repeat until EOS or max length
+//   7. Print each generated token as it appears
+//
+// Prompt processing (steps 2-3) is called "prefill" — we're not
+// generating yet, just letting the model "read" the prompt.
+//
+// Generation (steps 4-6) is called "decode" — one new token per
+// forward pass.
+
+// max_tokens is set 10 for testing, 1 token takes 30 seconds to generate.
+static void generate(GGUFModel& model, RunState& state,
+                     const std::string& prompt,
+                     int max_tokens = 10,
+                     float temperature = 0.7f,
+                     float top_p = 0.9f) {
+
+    const auto& cfg = model.config();
+    const auto& tok = model.tokenizer();
+    int n_vocab = static_cast<int>(cfg.n_vocab);
+
+    // ---- Step 1: Encode the prompt ----
+    std::vector<uint32_t> prompt_tokens = tok.encode(prompt);
+
+    // Prepend BOS token (the model expects this at the start)
+    prompt_tokens.insert(prompt_tokens.begin(), tok.bos_token());
+
+    std::cout << "Prompt tokens: " << prompt_tokens.size() << " [";
+    for (size_t i = 0; i < prompt_tokens.size(); i++) {
+        std::cout << prompt_tokens[i];
+        if (i + 1 < prompt_tokens.size()) std::cout << ", ";
+    }
+    std::cout << "]\n\n";
+
+    // ---- Step 2: Prefill — process prompt tokens ----
+    // Run forward pass for each prompt token to fill KV cache.
+    // We only care about the logits after the LAST prompt token.
+    int pos = 0;
+    int next_token = 0;
+
+    // Let the model read the prompt
+    for (size_t i = 0; i < prompt_tokens.size(); i++) {
+        forward(model, state, static_cast<int>(prompt_tokens[i]), pos);
+        pos++;
+    }
+
+    // Sample first generated token from logits after prefill
+    if (temperature <= 0.0f) {
+        next_token = sample_argmax(state.logits, n_vocab);
+    } else {
+        next_token = sample_top_p(state.logits, n_vocab, temperature, top_p);
+    }
+
+    // Print the first generated token
+    // flush() forces the output to appear on screen right away instead of waiting in a buffer. 
+    // This is what creates the "streaming" effect where you see words appear one by one.
+    std::string token_str = tok.decode_stripped({static_cast<uint32_t>(next_token)});
+    std::cout << token_str;
+    std::cout.flush();  // Print immediately, don't buffer
+
+    // ---- Step 3: Generate — one token at a time ----
+    for (int i = 1; i < max_tokens; i++) {
+        forward(model, state, next_token, pos);
+        pos++;
+
+        // Sample next token
+        if (temperature <= 0.0f) {
+            next_token = sample_argmax(state.logits, n_vocab);
+        } else {
+            next_token = sample_top_p(state.logits, n_vocab, temperature, top_p);
+        }
+
+        // Check for end of sequence
+        if (static_cast<uint32_t>(next_token) == tok.eos_token()) {
+            break;
+        }
+
+        // Check context window limit
+        if (pos >= static_cast<int>(cfg.n_ctx)) {
+            std::cout << "\n[reached max context length]\n";
+            break;
+        }
+
+        // Print the token
+        token_str = tok.decode_stripped({static_cast<uint32_t>(next_token)});
+        std::cout << token_str;
+        std::cout.flush();
+    }
+
+    std::cout << "\n";
+}
 
 // -------------------- main --------------------
 
@@ -888,104 +930,21 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::cerr << "Usage:\n"
-                      << "  ./engine <model.gguf>\n"
-                      << "  ./engine <model.gguf> dump <tensor_name> [n]\n";
+                      << "  ./engine <model.gguf> \"prompt text\"\n"
+                      << "  ./engine <model.gguf>                    (default prompt)\n"
+                      << "  ./engine <model.gguf> dump <tensor> [n]  (dump tensor)\n";
             return 1;
         }
 
         std::string path = argv[1];
         GGUFModel model(path);
 
+        std::cout << "Loaded " << model.config().architecture
+                  << " (" << model.config().n_layers << " layers, "
+                  << model.config().n_embd << " dim, "
+                  << model.config().n_vocab << " vocab)\n";
 
-        std::cout << "Loaded GGUF OK\n"
-          << "  version: " << model.version() << "\n"
-          << "  n_tensors: " << model.n_tensors() << "\n"
-          << "  n_kv: " << model.n_kv() << "\n"
-          << "  alignment: " << model.alignment() << "\n"
-          << "  tensor_data_start: " << model.tensor_data_start() << "\n"
-          << "  file_size: " << model.file_size() << "\n"
-          << "\nModel Config:\n"
-          << "  architecture: " << model.config().architecture << "\n"
-          << "  n_layers: " << model.config().n_layers << "\n"
-          << "  n_embd: " << model.config().n_embd << "\n"
-          << "  n_head: " << model.config().n_head << "\n"
-          << "  n_head_kv: " << model.config().n_head_kv << "\n"
-          << "  n_ff: " << model.config().n_ff << "\n"
-          << "  n_vocab: " << model.config().n_vocab << "\n"
-          << "  n_ctx: " << model.config().n_ctx << "\n"
-          << "  rope_dim: " << model.config().rope_dim << "\n"
-          << "  head_dim: " << model.config().head_dim() << "\n"
-          << "\nTokenizer:\n"
-          << "  vocab_size: " << model.tokenizer().vocab_size() << "\n"
-          << "  score_size: " << model.tokenizer().scores_size() << "\n"
-          << "  unk_token: " << model.tokenizer().unk_token() << "\n"
-          << "  bos_token: " << model.tokenizer().bos_token() << "\n"
-          << "  eos_token: " << model.tokenizer().eos_token() << "\n";
-
-        std::vector<std::uint32_t> test_tokens = {1, 2, 3};
-        std::cout << "  decode({1,2,3}): \"" << model.tokenizer().decode_stripped(test_tokens) << "\"\n";
-
-        std::string test_text = "Hello";
-        std::vector<uint32_t> encoded = model.tokenizer().encode(test_text);
-        std::cout << "  encode(\"Hello\"): [";
-        for (size_t i = 0; i < encoded.size(); i++) {
-            std::cout << encoded[i];
-            if (i + 1 < encoded.size()) std::cout << ", ";
-        }
-        std::cout << "]\n";
-
-        // Test round-trip
-        std::string decoded = model.tokenizer().decode_stripped(encoded);
-        std::cout << "  decode back: \"" << decoded << "\"\n";
-
-        // Test various inputs
-        std::vector<std::string> test_cases = {
-            "Hello",
-            " Hello",      // with leading space
-            "Hello world",
-            "The quick brown fox",
-            "123",
-            "don't",
-        };
-
-        std::cout << "\nTokenizer tests:\n";
-        for (const auto& text : test_cases) {
-            auto ids = model.tokenizer().encode(text);
-            auto decoded = model.tokenizer().decode_stripped(ids);
-            
-            std::cout << "  input string: '" << text << "' → encoded values of string: [";
-            for (size_t i = 0; i < ids.size(); i++) {
-                std::cout << ids[i];
-                if (i + 1 < ids.size()) std::cout << ", ";
-            }
-            std::cout << "] → decoded values of ids: '" << decoded << "'";
-            
-            // Check round-trip
-            if (decoded == text) {
-                std::cout << " ✓\n";
-            } else {
-                std::cout << " ✗ MISMATCH\n";
-            }
-        }
-
-        // Forward pass smoke test
-        RunState state;
-        state.allocate(model.config());
-        int bos = static_cast<int>(model.tokenizer().bos_token());
-        forward(model, state, bos, 0);
-
-        // Find top prediction
-        float max_logit = state.logits[0];
-        int max_id = 0;
-        for (int i = 1; i < static_cast<int>(model.config().n_vocab); i++) {
-            if (state.logits[i] > max_logit) {
-                max_logit = state.logits[i];
-                max_id = i;
-            }
-        }
-        std::cout << "Top prediction after BOS: token " << max_id 
-        << " (\"" << model.tokenizer().decode_stripped({static_cast<uint32_t>(max_id)}) << "\")\n";
-
+        // Handle dump mode (keep existing functionality)
         if (argc >= 4 && std::string(argv[2]) == "dump") {
             std::string name = argv[3];
             std::size_t n = 10;
@@ -993,16 +952,27 @@ int main(int argc, char** argv) {
                 n = static_cast<std::size_t>(std::strtoull(argv[4], nullptr, 10));
                 if (n == 0) n = 10;
             }
-            std::cout << "\nDumping tensor\n";
             model.dump_tensor(name, n);
-            std::cout << "\n";
-        } else {
-            // quick default sanity dumps
-            std::cout << "\nDumping 2 tensors\n";
-            model.dump_tensor("blk.0.attn_norm.weight", 10);
-            std::cout << "\n";
-            model.dump_tensor("token_embd.weight", 10);
+            return 0;
         }
+
+        // Allocate runtime state
+        RunState state;
+        state.allocate(model.config());
+
+        // Get prompt from command line or use default
+        std::string prompt;
+        if (argc >= 3) {
+            prompt = argv[2];
+        } else {
+            // TinyLlama chat template format
+            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the meaning of life?</s>\n<|assistant|>\n";
+        }
+
+        std::cout << "Prompt: \"" << prompt << "\"\n";
+        std::cout << "Generating (this will be slow with naive matmul)...\n\n";
+
+        generate(model, state, prompt);
 
         return 0;
     } catch (const std::exception& e) {
@@ -1010,5 +980,3 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
-
-

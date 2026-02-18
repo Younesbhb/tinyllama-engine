@@ -7,7 +7,6 @@ engine: src/main.cpp src/tokenizer.cpp src/ops.cpp
 test_ops: src/test_ops.cpp src/ops.cpp
 	$(CXX) $(CXXFLAGS) src/test_ops.cpp src/ops.cpp -o $@
 
-
 .PHONY: clean
 clean:
 	rm -f engine test_ops

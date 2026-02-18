@@ -3,6 +3,9 @@
 #include <cstring>
 #include <stdexcept>
 #include <limits>
+#include <algorithm>
+#include <random>
+#include <numeric>
 
 // -------------------- FP16 → F32 conversion --------------------
 // Duplicated from main.cpp for now. When you refactor later, move this
@@ -127,6 +130,8 @@ void matmul(float* out, const void* W, const float* x,
 // RMSNorm is simpler than LayerNorm:
 //   - LayerNorm: subtract mean, divide by stddev, scale + shift
 //   - RMSNorm:   divide by RMS, scale only (no mean, no shift)
+// 
+// The formula: xb = (x / √(mean(x²) + ε)) × weight
 //
 // Steps:
 //   1. Compute mean of squares: ms = (1/n) * sum(x_i^2)
@@ -280,7 +285,8 @@ void vec_add(float* out, const float* x, int size) {
 // We apply the SAME rotation logic to both Q and K vectors. This way,
 // when attention computes dot(Q, K), the result naturally depends on
 // the relative distance between the two tokens.
-
+//
+// RoPE modifies the q and k vectors in place — the original values are overwritten with rotated values.
 void rope(float* q, float* k, int pos, int head_dim,
           int n_head, int n_head_kv, float freq_base) {
 
@@ -367,7 +373,9 @@ void rope(float* q, float* k, int pos, int head_dim,
 //     Query heads 24-31 → KV head 3
 //   Formula: kv_head = query_head / (n_head / n_head_kv)
 //   For TinyLlama: kv_head = query_head / 8
-
+//
+//
+// attention is always from the perspective of the token being processed right now. When we're at position 3 processing "sat", the query belongs to "sat". We compare "sat"'s query against every cached key to find out which past tokens are relevant **to "sat"**.
 void attention(float* out, const float* q, const float* k, const float* v,
                float* key_cache, float* value_cache, float* att,
                int layer, int pos, const llama_config_t& cfg) {
@@ -397,10 +405,20 @@ void attention(float* out, const float* q, const float* k, const float* v,
     //
     // We copy all kv_dim values (4 heads × 64 dims = 256 floats)
 
+    // Find where this layer's portion of the cache starts. 
+    // The entire key cache is one giant flat array. Layer 0 gets the first chunk, layer 1 gets the next, etc. 
+    // For layer 5: layer_offset = 5 × 2048 × 256 = 2,621,440. 
+    // That's how many floats to skip to reach layer 5's section.
     int layer_offset = layer * n_ctx * kv_dim;
 
     float* k_cache_pos = key_cache + layer_offset + pos * kv_dim;
     float* v_cache_pos = value_cache + layer_offset + pos * kv_dim;
+
+
+    // Copy the current token's 256-float key and 256-float value into the cache. 
+    // After this, the cache now has keys and values for positions 0, 1, 2, AND 3. 
+    // These will stay in the cache for all future tokens.
+    // When position 50 is processed later, it can look back and see what we stored here.
 
     for (int i = 0; i < kv_dim; i++) {
         k_cache_pos[i] = k[i];
@@ -409,6 +427,8 @@ void attention(float* out, const float* q, const float* k, const float* v,
 
     // ---- Step 2: For each query head, compute attention ----
 
+    // Loop through all 32 query heads. Each head independently decides what to pay attention to. 
+    // One head might focus on grammar, another on meaning, another on nearby words, etc.
     for (int qh = 0; qh < n_head; qh++) {
 
         // Pointer to this query head's 64-dim slice
@@ -424,9 +444,9 @@ void attention(float* out, const float* q, const float* k, const float* v,
         //
         // This tells us "how relevant is position t to the current token?"
 
-        for (int t = 0; t <= pos; t++) {
-            // Pointer to the cached key at position t, KV head kvh
-            const float* k_cached = key_cache + layer_offset + t * kv_dim + kvh * head_dim;
+        for (int p = 0; p <= pos; p++) {
+            // Pointer to the cached key at position p, KV head kvh
+            const float* k_cached = key_cache + layer_offset + p * kv_dim + kvh * head_dim;
 
             // Dot product of q_head and k_cached (both are 64 floats)
             float score = 0.0f;
@@ -434,7 +454,9 @@ void attention(float* out, const float* q, const float* k, const float* v,
                 score += q_head[d] * k_cached[d];
             }
 
-            att[t] = score * scale;
+            // High score = "these two tokens are very relevant to each other." 
+            // Low score = "not relevant."
+            att[p] = score * scale;
         }
 
         // ---- Step 2b: Softmax the scores into attention weights ----
@@ -525,4 +547,163 @@ void ffn_swiglu(float* out, const float* input,
     // Step 5: Shrink back from 5632 to 2048
     // out = W_down * hb
     matmul(out, W_down, hb, n_embd, n_ff, type);
+}
+
+
+// -------------------- Global random engine --------------------
+// We use one shared random engine so results vary between calls.
+// seeded with random_device for non-deterministic output.
+
+static std::mt19937& get_rng() {
+    static std::mt19937 rng(std::random_device{}());
+    return rng;
+}
+
+
+// -------------------- Argmax (Greedy) Sampling --------------------
+//
+// Walk through all 32,000 logits, find the biggest one, return its index.
+// That's it. No randomness, no creativity.
+//
+// Example:
+//   logits = [..., -2.1, 8.7, 1.3, ...]
+//                         ^-- index 3042 is highest
+//   returns 3042
+
+int sample_argmax(const float* logits, int n_vocab) {
+    int best = 0;
+    float best_val = logits[0];
+    for (int i = 1; i < n_vocab; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+
+// -------------------- Temperature Sampling --------------------
+//
+// Temperature controls how "creative" the model is:
+//
+//   temp = 0.1: Almost greedy. Model is very confident, picks
+//               the obvious next word almost every time.
+//   temp = 1.0: Normal. The probabilities are as the model intended.
+//   temp = 2.0: Very random. Even unlikely words get picked often.
+//
+// How it works:
+//   1. Divide every logit by temperature
+//      - Low temp → differences between logits get exaggerated
+//        (big logits get even bigger relative to small ones)
+//      - High temp → differences shrink (everything becomes similar)
+//   2. Softmax → probabilities
+//   3. Roll a random number and pick a token based on probabilities
+//
+// Example with logits [3.0, 1.0, 0.5]:
+//   temp=0.5: logits become [6.0, 2.0, 1.0] → softmax ≈ [0.98, 0.02, 0.00]
+//             (almost always picks the first token)
+//   temp=1.0: logits stay   [3.0, 1.0, 0.5] → softmax ≈ [0.78, 0.11, 0.06]
+//   temp=2.0: logits become [1.5, 0.5, 0.25]→ softmax ≈ [0.47, 0.17, 0.13]
+//             (much more likely to pick less common tokens)
+
+int sample_temperature(float* logits, int n_vocab, float temperature) {
+    // Scale logits by temperature
+    if (temperature != 1.0f && temperature > 0.0f) {
+        float inv_temp = 1.0f / temperature;
+        for (int i = 0; i < n_vocab; i++) {
+            logits[i] *= inv_temp;
+        }
+    }
+
+    // Convert to probabilities
+    softmax(logits, n_vocab);
+
+    // Sample: generate random number in [0, 1), walk through
+    // probabilities until cumulative sum exceeds it
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(get_rng());
+
+    float cumsum = 0.0f;
+    for (int i = 0; i < n_vocab; i++) {
+        cumsum += logits[i];
+        if (cumsum > r) {
+            return i;
+        }
+    }
+
+    // Fallback (shouldn't happen if softmax sums to 1.0)
+    return n_vocab - 1;
+}
+
+
+// -------------------- Top-P (Nucleus) Sampling --------------------
+//
+// The problem with pure temperature sampling: even with reasonable
+// temperature, the model might occasionally pick a wildly unlikely
+// token (probability 0.001%) that produces garbage.
+//
+// Top-P fixes this by cutting off the tail. If top_p = 0.9:
+//   1. Sort tokens by probability (highest first)
+//   2. Walk down the sorted list, accumulating probability
+//   3. Once you've accumulated 90%, stop — ignore everything below
+//   4. Sample only from that top group
+//
+// Example: probabilities after softmax = [0.40, 0.30, 0.15, 0.10, 0.05]
+//   with top_p = 0.9:
+//     token 0: cumsum = 0.40 (keep)
+//     token 1: cumsum = 0.70 (keep)
+//     token 2: cumsum = 0.85 (keep)
+//     token 3: cumsum = 0.95 > 0.9 (keep this one, then stop)
+//     token 4: ignored
+//   Sample from tokens 0-3 only, re-normalized.
+//
+// This is the standard sampling method for chat models.
+
+int sample_top_p(float* logits, int n_vocab, float temperature, float top_p) {
+    // Apply temperature
+    if (temperature != 1.0f && temperature > 0.0f) {
+        float inv_temp = 1.0f / temperature;
+        for (int i = 0; i < n_vocab; i++) {
+            logits[i] *= inv_temp;
+        }
+    }
+
+    // Convert to probabilities
+    softmax(logits, n_vocab);
+
+    // Create index array sorted by probability (descending)
+    // We need to track which token ID each probability belongs to
+    std::vector<int> indices(n_vocab);
+    std::iota(indices.begin(), indices.end(), 0);  // fill with 0, 1, 2, ...
+
+    std::partial_sort(indices.begin(), indices.begin() + std::min(n_vocab, 100), indices.end(),
+        [&logits](int a, int b) {
+            return logits[a] > logits[b];
+        });
+
+    // Walk through sorted tokens, accumulate probability until we hit top_p
+    float cumsum = 0.0f;
+    int cutoff = 0;
+    for (int i = 0; i < n_vocab; i++) {
+        cumsum += logits[indices[i]];
+        cutoff = i + 1;
+        if (cumsum >= top_p) break;
+    }
+
+    // Sample from the top-p set
+    // Re-normalize the kept probabilities
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    float r = dist(get_rng()) * cumsum;
+
+    float running = 0.0f;
+    for (int i = 0; i < cutoff; i++) {
+        running += logits[indices[i]];
+        if (running > r) {
+            return indices[i];
+        }
+    }
+
+    // Fallback
+    return indices[0];
 }

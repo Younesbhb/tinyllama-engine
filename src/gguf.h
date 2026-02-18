@@ -37,7 +37,7 @@ struct llama_config_t {
     std::uint32_t n_layers = 0;           // llama.block_count/llama.layer_count AKA transformer blocks
     std::uint32_t n_embd = 0;             // llama.embedding_length (hidden dimensions)
     std::uint32_t n_head = 0;             // llama.attention.head_count nb of attention heads (Query heads)
-    std::uint32_t n_head_kv = 0;          // llama.attention.head_count_kv (for GQA) AKA Key/value heads (GQA: 32/4 = 8 queries share each KV)
+    std::uint32_t n_head_kv = 0;          // llama.attention.head_count_kv (for GQA) AKA Key/value heads, 4 KV heads
 
     std::uint32_t n_ff = 0;               // llama.feed_forward_length
     

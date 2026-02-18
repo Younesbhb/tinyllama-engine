@@ -580,6 +580,61 @@ void test_matmul_realistic_size() {
 }
 
 
+void test_sampling() {
+    std::cout << "\n=== sampling ===\n";
+
+    // --- Argmax ---
+    {
+        float logits[] = {1.0f, 5.0f, 3.0f, 2.0f};
+        int result = sample_argmax(logits, 4);
+        check("argmax picks index 1 (value 5.0)", result == 1);
+    }
+
+    {
+        float logits[] = {-1.0f, -5.0f, -0.5f, -2.0f};
+        int result = sample_argmax(logits, 4);
+        check("argmax with all negatives picks -0.5 (index 2)", result == 2);
+    }
+
+    // --- Temperature sampling: temp=0 should behave like argmax ---
+    // (We can't easily test random sampling deterministically,
+    //  but we can verify the structure works without crashing)
+    {
+        // Run temperature sampling a few times - should not crash
+        bool no_crash = true;
+        for (int trial = 0; trial < 10; trial++) {
+            float logits_copy[] = {1.0f, 10.0f, 2.0f, 0.5f, 0.1f};
+            int result = sample_temperature(logits_copy, 5, 1.0f);
+            if (result < 0 || result >= 5) { no_crash = false; break; }
+        }
+        check("temperature sampling: valid token IDs", no_crash);
+    }
+
+    // --- Top-P sampling ---
+    {
+        bool no_crash = true;
+        for (int trial = 0; trial < 10; trial++) {
+            float logits_copy[] = {1.0f, 10.0f, 2.0f, 0.5f, 0.1f};
+            int result = sample_top_p(logits_copy, 5, 0.8f, 0.9f);
+            if (result < 0 || result >= 5) { no_crash = false; break; }
+        }
+        check("top-p sampling: valid token IDs", no_crash);
+    }
+
+    // --- Top-P with very low p should mostly pick the top token ---
+    {
+        int top_count = 0;
+        for (int trial = 0; trial < 20; trial++) {
+            float logits_copy[] = {0.0f, 100.0f, 0.0f, 0.0f, 0.0f};
+            int result = sample_top_p(logits_copy, 5, 0.5f, 0.1f);
+            if (result == 1) top_count++;
+        }
+        // With logit 100 and low temp+p, should almost always pick token 1
+        check("top-p with dominant logit picks it consistently", top_count >= 18);
+    }
+}
+
+
 // -------------------- main --------------------
 
 int main() {
@@ -597,16 +652,17 @@ int main() {
     test_attention();
     test_rope();
     test_matmul_realistic_size();
+    test_sampling();
 
     std::cout << "\n============================\n";
     std::cout << "Results: " << tests_passed << " passed, "
               << tests_failed << " failed\n";
 
     if (tests_failed > 0) {
-        std::cout << "⚠ Some tests failed! Fix before moving to Phase 5.\n";
+        std::cout << "⚠ Some tests failed!\n";
         return 1;
     } else {
-        std::cout << "✓ All tests passed! Ready for Phase 5 (Transformer components).\n";
+        std::cout << "✓ All tests passed! Ready for Phase 6 (Generation Loop).\n";
         return 0;
     }
 }
