@@ -1,8 +1,10 @@
 #include "tokenizer.h"
 #include <algorithm>  // for std::min
 #include <stdexcept>
+#include <cstdio>     // for snprintf, sscanf
 
 // Initialize vocab_ and scores_ and token_to_id_
+// scores_ is not used in our implementation
 void Tokenizer::load(std::vector<std::string>&& vocab, std::vector<float>&& scores) {
     vocab_ = std::move(vocab);
     scores_ = std::move(scores);
@@ -27,6 +29,7 @@ void Tokenizer::load(std::vector<std::string>&& vocab, std::vector<float>&& scor
     eos_id_ = find_token("</s>");
 }
 
+// The decode function converts token IDs back into readable text. 
 std::string Tokenizer::decode(const std::vector<std::uint32_t>& tokens) const {
     size_t total_size = 0;
     //First pass: calculate size
@@ -41,7 +44,32 @@ std::string Tokenizer::decode(const std::vector<std::uint32_t>& tokens) const {
     result.reserve(total_size);
     for (auto id : tokens) {
         if (static_cast<size_t>(id) < vocab_.size()) {
-            result += vocab_[id];
+            const std::string& tok = vocab_[id];
+            // Check for byte tokens like <0x0A>, <0x0D>, etc.
+            // These are 6 characters: '<' '0' 'x' H H '>'
+            // Cheap check first
+            if (tok.size() == 6 && tok[0] == '<' && tok[1] == '0' && tok[2] == 'x' && tok[5] == '>') {
+                // Parse the two hex digits
+                unsigned int byte_val = 0;
+                // Expensive check only if needed
+                if (std::sscanf(tok.c_str(), "<0x%02X>", &byte_val) == 1 && byte_val <= 255) {
+                    // Convert the number to an actual character and append it. For byte_val = 10, static_cast<char>(10) is the newline character \n. 
+                    // For byte_val = 32, it's a space. For byte_val = 13, it's carriage return \r.
+
+                    // % 0 2 X
+                    // │ │ │ │
+                    // │ │ │ └── type: X = uppercase hexadecimal (A-F). Lowercase x would give a-f.
+                    // │ │ └── width: at least 2 characters wide
+                    // │ └── fill: pad with '0' instead of spaces
+                    // └── start of specifier
+
+                    result += static_cast<char>(byte_val);
+                } else {
+                    result += tok;  // couldn't parse, keep as-is
+                }
+            } else {
+                result += tok;
+            }
         }
     }
     
@@ -120,7 +148,19 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
             tokens.push_back(best_id);
             pos += best_len;
         } else {
-            tokens.push_back(unk_id_);
+            // Byte-level fallback: encode the unknown byte as <0xNN>
+            // The vocabulary contains tokens like <0x0A> (newline), <0x0D> (carriage return), etc.
+            // This handles any character our greedy matcher can't find a token for.
+            unsigned char byte = static_cast<unsigned char>(processed[pos]);
+            char hex[8];
+            std::snprintf(hex, sizeof(hex), "<0x%02X>", byte);
+            auto it = token_to_id_.find(std::string(hex));
+            if (it != token_to_id_.end()) {
+                tokens.push_back(it->second);
+            } else {
+                // Truly unknown byte — no byte token exists
+                tokens.push_back(unk_id_);
+            }
             pos += 1;
         }
     }
@@ -140,16 +180,15 @@ uint32_t Tokenizer::scores_size() const{
 }
 
 
-//Will be used in Phase 6 (Generation Loop)
+// Useful for Generation Loop
 uint32_t Tokenizer::unk_token() const {
     return unk_id_;
 }
-//Will be used in Phase 6 (Generation Loop)
+// Useful for Generation Loop
 uint32_t Tokenizer::bos_token() const {
     return bos_id_;
 }
-//Will be used in Phase 6 (Generation Loop)
+// Useful for Generation Loop
 uint32_t Tokenizer::eos_token() const {
     return eos_id_;
 }
-

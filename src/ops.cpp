@@ -8,11 +8,8 @@
 #include <numeric>
 
 // -------------------- FP16 → F32 conversion --------------------
-// Duplicated from main.cpp for now. When you refactor later, move this
-// to a shared utility header. Keeping it here avoids coupling ops.cpp
-// to the GGUFModel internals.
 
-static float fp16_to_f32(std::uint16_t h) {
+float fp16_to_f32(std::uint16_t h) {
     std::uint32_t sign = (static_cast<std::uint32_t>(h) & 0x8000u) << 16;
     std::uint32_t exp  = (static_cast<std::uint32_t>(h) >> 10) & 0x1Fu;
     std::uint32_t mant =  static_cast<std::uint32_t>(h) & 0x3FFu;

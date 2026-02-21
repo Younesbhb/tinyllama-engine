@@ -11,7 +11,18 @@
 // Phase 8: Will be optimized with ARM NEON SIMD
 // -------------------- ----------------------------------------
 
+// Helper 
+//
 
+float fp16_to_f32(std::uint16_t h);
+  
+
+
+//
+//
+//
+//
+//
 // -------------------- Matrix-Vector Multiply --------------------
 // The core operation of LLM inference.
 // Computes: out[i] = sum_j( W[i,j] * x[j] )  for i in [0, rows)
