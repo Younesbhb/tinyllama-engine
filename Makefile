@@ -1,5 +1,5 @@
 CXX=clang++
-CXXFLAGS=-std=c++20 -O0 -g -Wall -Wextra
+CXXFLAGS=-std=c++20 -O2 -g -Wall -Wextra
 
 SRCS=src/main.cpp src/gguf_model.cpp src/forward.cpp src/generate.cpp \
      src/tokenizer.cpp src/ops.cpp

@@ -8,8 +8,18 @@
 // in the GGUF file and are converted on the fly during matmul.
 //
 // Phase 4: Naive implementations (correct but slow)
-// Phase 8: Will be optimized with ARM NEON SIMD
+// Phase 8: ARM NEON SIMD optimized versions
 // -------------------- ----------------------------------------
+
+// -------------------- Backend Selection --------------------
+// Choose at runtime between naive (scalar) and NEON (SIMD) implementations.
+// Use set_backend() before running inference, then all ops dispatch accordingly.
+// On non-ARM platforms, NEON is unavailable and naive is always used.
+
+enum class Backend { NAIVE, NEON };
+
+void set_backend(Backend b);
+Backend get_backend();
 
 // Helper 
 //

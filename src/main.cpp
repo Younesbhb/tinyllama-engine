@@ -1,9 +1,11 @@
 #include "gguf_model.h"
 #include "run_state.h"
 #include "generate.h"
+#include "ops.h"
 
 #include <iostream>
 #include <string>
+#include <cstring>
 #include <cstdlib>
 
 
@@ -36,6 +38,8 @@
 
 // head_dim (64): The size of each head's vector. It's calculated as n_embd / n_head = 2048 / 32 = 64. Each head works on a 64-dimensional slice. All 32 heads together: 32 × 64 = 2048 (the full hidden state).
 
+// kv_dim (256): is the total size of all KV heads combined. It's how many floats make up one position's key (or value) in the cache.
+
 // What is normalizing?
 // Imagine you have the numbers [1000, 2000, 3000]. After multiplying through several layers, they might become [5000000, 10000000, 15000000]. After a few more layers, they could overflow to infinity.
 // Normalizing scales them back to a reasonable range. RMSNorm takes those giant numbers and rescales them so the average magnitude is around 1.0:
@@ -53,9 +57,35 @@ int main(int argc, char** argv) {
             std::cerr << "Usage:\n"
                       << "  ./engine <model.gguf> \"prompt text\"\n"
                       << "  ./engine <model.gguf>                    (default prompt)\n"
-                      << "  ./engine <model.gguf> dump <tensor> [n]  (dump tensor)\n";
+                      << "  ./engine <model.gguf> dump <tensor> [n]  (dump tensor)\n"
+                      << "\nOptions:\n"
+                      << "  --backend naive   Use naive (unoptimized) implementations\n"
+                      << "  --backend neon    Use ARM NEON SIMD implementations (default on ARM)\n";
             return 1;
         }
+
+        // Parse --backend flag (can appear anywhere in args)
+        for (int i = 1; i < argc - 1; i++) {
+            if (std::strcmp(argv[i], "--backend") == 0) {
+                std::string val = argv[i + 1];
+                if (val == "naive") {
+                    set_backend(Backend::NAIVE);
+                } else if (val == "neon") {
+                    set_backend(Backend::NEON);
+                } else {
+                    std::cerr << "Unknown backend: " << val << " (use 'naive' or 'neon')\n";
+                    return 1;
+                }
+                // Shift remaining args to remove --backend and its value
+                for (int j = i; j < argc - 2; j++) {
+                    argv[j] = argv[j + 2];
+                }
+                argc -= 2;
+                break;
+            }
+        }
+
+        std::cout << "Backend: " << (get_backend() == Backend::NEON ? "NEON" : "naive") << "\n";
 
         std::string path = argv[1];
         GGUFModel model(path);
@@ -92,7 +122,7 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "Prompt: \"" << prompt << "\"\n";
-        std::cout << "Generating (this will be slow with naive matmul)...\n\n";
+        std::cout << "Generating...\n\n";
 
         generate(model, state, prompt);
 

@@ -7,7 +7,39 @@
 #include <random>
 #include <numeric>
 
+// Phase 8: ARM NEON SIMD optimization
+// On ARM (your M2 Mac), this header gives us access to NEON intrinsics —
+// special C functions that map directly to hardware instructions which
+// process 4 floats at once instead of 1.
+//
+// The #ifdef guard means this code still compiles on non-ARM machines
+// (like x86 Linux), it just falls back to the naive loops.
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
+
+
+// -------------------- Backend Selection --------------------
+// Global flag that controls whether NEON or naive code runs.
+// Default to NEON on ARM, naive everywhere else.
+// Can be changed at runtime via set_backend().
+
+static Backend g_backend =
+#ifdef __ARM_NEON
+    Backend::NEON;
+#else
+    Backend::NAIVE;
+#endif
+
+void set_backend(Backend b) { g_backend = b; }
+Backend get_backend() { return g_backend; }
+
+
 // -------------------- FP16 → F32 conversion --------------------
+// This manual conversion is still needed for non-matmul uses (e.g. dump_tensor)
+// and for the naive matmul_f16 path.
+// Inside the NEON matmul_f16, we use the hardware instruction vcvt_f32_f16
+// instead, which converts 4 half-floats in a single cycle.
 
 float fp16_to_f32(std::uint16_t h) {
     std::uint32_t sign = (static_cast<std::uint32_t>(h) & 0x8000u) << 16;
@@ -60,9 +92,85 @@ float fp16_to_f32(std::uint16_t h) {
 // Bottleneck: Loading W from RAM. For a 2048x2048 F32 matrix = 16MB.
 //             At ~100 GB/s bandwidth, that's ~160μs just to load.
 //             The actual multiplications take far less time.
+//
+// NEON optimization: We use 4 accumulator registers to process 16 floats
+// per loop iteration. Why 4 accumulators instead of 1?
+// The CPU can start the next FMA instruction while the previous one is
+// still finishing (instruction pipelining). With 1 accumulator, each FMA
+// depends on the previous one's result, so the CPU stalls. With 4
+// independent accumulators, the CPU keeps all its execution units busy.
 
 void matmul_f32(float* out, const float* W, const float* x,
                 int rows, int cols) {
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        for (int i = 0; i < rows; i++) {
+            const float* row = W + i * cols;
+
+            // 4 independent accumulator registers — each holds 4 partial sums.
+            // By using 4 separate accumulators, the CPU can pipeline the FMA
+            // instructions without waiting for the previous result.
+            // vdupq_n_f32(val): Create a register with all 4 slots set to val
+            float32x4_t sum0 = vdupq_n_f32(0.0f);  // [0, 0, 0, 0]
+            float32x4_t sum1 = vdupq_n_f32(0.0f);
+            float32x4_t sum2 = vdupq_n_f32(0.0f);
+            float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+            int j = 0;
+
+            // Main loop: process 16 floats per iteration (4 registers × 4 floats)
+            // For cols=2048, this runs 128 times instead of 2048
+            for (; j + 15 < cols; j += 16) {
+                // Load 16 weights from the current row
+                // vld1q_f32(ptr): Load 4 consecutive floats from memory into a register
+                float32x4_t w0 = vld1q_f32(row + j);       // row[j..j+3]
+                float32x4_t w1 = vld1q_f32(row + j + 4);   // row[j+4..j+7]
+                float32x4_t w2 = vld1q_f32(row + j + 8);   // row[j+8..j+11]
+                float32x4_t w3 = vld1q_f32(row + j + 12);  // row[j+12..j+15]
+
+                // Load 16 input values
+                float32x4_t x0 = vld1q_f32(x + j);
+                float32x4_t x1 = vld1q_f32(x + j + 4);
+                float32x4_t x2 = vld1q_f32(x + j + 8);
+                float32x4_t x3 = vld1q_f32(x + j + 12);
+
+                // Fused multiply-add: sum += w * x (4 floats at a time)
+                // Each of these does 4 multiplications + 4 additions in one instruction
+                // vfmaq_f32(acc, a, b): Fused multiply-add: acc + (a * b) element-wise
+                sum0 = vfmaq_f32(sum0, w0, x0);
+                sum1 = vfmaq_f32(sum1, w1, x1);
+                sum2 = vfmaq_f32(sum2, w2, x2);
+                sum3 = vfmaq_f32(sum3, w3, x3);
+            }
+
+            // Combine the 4 accumulators into one
+            // sum0 + sum1 + sum2 + sum3 → one register with 4 partial sums
+            // vaddq_f32(a, b): Add element-wise
+            float32x4_t total = vaddq_f32(vaddq_f32(sum0, sum1),
+                                          vaddq_f32(sum2, sum3));
+
+            // Handle leftover elements (if cols isn't a multiple of 16)
+            // Process 4 at a time
+            for (; j + 3 < cols; j += 4) {
+                total = vfmaq_f32(total, vld1q_f32(row + j), vld1q_f32(x + j));
+            }
+
+            // Horizontal sum: add the 4 floats inside the register into one number
+            // [a, b, c, d] → a + b + c + d
+            // vaddvq_f32(reg) : Horizontal sum, collapse 4 floats into 1
+            float sum = vaddvq_f32(total);
+
+            // Scalar tail: handle any remaining elements (0-3 floats)
+            for (; j < cols; j++) {
+                sum += row[j] * x[j];
+            }
+
+            out[i] = sum;
+        }
+        return;
+    }
+#endif
+    // Naive path
     for (int i = 0; i < rows; i++) {
         float sum = 0.0f;
         // Pointer to the start of row i in the weight matrix
@@ -83,9 +191,73 @@ void matmul_f32(float* out, const float* W, const float* x,
 // This is the common case for TinyLlama F16 GGUF files.
 // The conversion overhead is negligible because the CPU is already
 // waiting for the next cache line of weights to arrive from RAM.
+//
+// NEON optimization: uses vcvt_f32_f16() — a single hardware instruction that
+// converts 4 half-floats to 4 full floats in one cycle. This replaces
+// 4 calls to the 30-line fp16_to_f32() function. Since TinyLlama's weights
+// are all F16, this is where the biggest speedup comes from.
 
 void matmul_f16(float* out, const std::uint16_t* W, const float* x,
                 int rows, int cols) {
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        for (int i = 0; i < rows; i++) {
+            const std::uint16_t* row = W + i * cols;
+
+            float32x4_t sum0 = vdupq_n_f32(0.0f);
+            float32x4_t sum1 = vdupq_n_f32(0.0f);
+            float32x4_t sum2 = vdupq_n_f32(0.0f);
+            float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+            int j = 0;
+
+            // Main loop: process 16 half-floats per iteration
+            for (; j + 15 < cols; j += 16) {
+                // Load 4 uint16 values, reinterpret as half-float, convert to float32
+                // This replaces 4 calls to fp16_to_f32() with ONE hardware instruction
+                //
+                // vld1_u16:             load 4 × uint16 from memory
+                // vreinterpret_f16_u16: tell the CPU "these bits are half-floats"
+                // vcvt_f32_f16:         convert 4 half-floats → 4 full floats (1 cycle!)
+                float32x4_t w0 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(row + j)));
+                float32x4_t w1 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(row + j + 4)));
+                float32x4_t w2 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(row + j + 8)));
+                float32x4_t w3 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(row + j + 12)));
+
+                float32x4_t x0 = vld1q_f32(x + j);
+                float32x4_t x1 = vld1q_f32(x + j + 4);
+                float32x4_t x2 = vld1q_f32(x + j + 8);
+                float32x4_t x3 = vld1q_f32(x + j + 12);
+
+                sum0 = vfmaq_f32(sum0, w0, x0);
+                sum1 = vfmaq_f32(sum1, w1, x1);
+                sum2 = vfmaq_f32(sum2, w2, x2);
+                sum3 = vfmaq_f32(sum3, w3, x3);
+            }
+
+            float32x4_t total = vaddq_f32(vaddq_f32(sum0, sum1),
+                                          vaddq_f32(sum2, sum3));
+
+            // Leftover: 4 at a time
+            for (; j + 3 < cols; j += 4) {
+                float32x4_t w = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(row + j)));
+                float32x4_t v = vld1q_f32(x + j);
+                total = vfmaq_f32(total, w, v);
+            }
+
+            float sum = vaddvq_f32(total);
+
+            // Scalar tail
+            for (; j < cols; j++) {
+                sum += fp16_to_f32(row[j]) * x[j];
+            }
+
+            out[i] = sum;
+        }
+        return;
+    }
+#endif
+    // Naive path
     for (int i = 0; i < rows; i++) {
         float sum = 0.0f;
         // Pointer to the start of row i (each element is 2 bytes)
@@ -137,9 +309,48 @@ void matmul(float* out, const void* W, const float* x,
 //
 // The epsilon (eps) prevents division by zero when the vector is all zeros.
 // TinyLlama uses eps = 1e-5 (from config.rms_norm_eps).
+//
+// NEON: both the sum-of-squares loop and the normalize loop benefit
+// from processing 4 floats at a time.
 
 void rmsnorm(float* out, const float* x, const float* weight,
              int size, float eps) {
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        // Step 1: sum of squares using NEON
+        float32x4_t ss_vec = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t v = vld1q_f32(x + i);
+            ss_vec = vfmaq_f32(ss_vec, v, v);   // ss += x[i]^2 (4 at a time)
+        }
+        float ss = vaddvq_f32(ss_vec);
+        // Scalar tail
+        for (; i < size; i++) {
+            ss += x[i] * x[i];
+        }
+
+        // Step 2: 1 / sqrt(mean_of_squares + eps)
+        float rms = 1.0f / std::sqrt(ss / static_cast<float>(size) + eps);
+
+        // Step 3: normalize and scale using NEON
+        float32x4_t rms_vec = vdupq_n_f32(rms);
+        i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t v = vld1q_f32(x + i);
+            float32x4_t w = vld1q_f32(weight + i);
+            // out = x * rms * weight
+            float32x4_t result = vmulq_f32(vmulq_f32(v, rms_vec), w);
+            vst1q_f32(out + i, result);
+        }
+        // Scalar tail
+        for (; i < size; i++) {
+            out[i] = x[i] * rms * weight[i];
+        }
+        return;
+    }
+#endif
+    // Naive path
     // Step 1: sum of squares
     float ss = 0.0f;
     for (int i = 0; i < size; i++) {
@@ -168,6 +379,8 @@ void rmsnorm(float* out, const float* x, const float* weight,
 // Used in two places:
 //   1. Attention: softmax over attention scores (per-head, per-query)
 //   2. Generation: softmax over final logits to get token probabilities
+//
+// Not NEON-optimized: the exp() call dominates and has no NEON equivalent.
 
 void softmax(float* x, int size) {
     // Step 1: find max for numerical stability
@@ -201,6 +414,8 @@ void softmax(float* x, int size) {
 // SiLU is smoother than ReLU near zero, which gives better gradients.
 // It's the activation that made Llama/PaLM models work better than
 // older architectures using plain ReLU.
+//
+// Not NEON-optimized: exp() has no NEON equivalent.
 
 void silu(float* x, int size) {
     for (int i = 0; i < size; i++) {
@@ -225,6 +440,21 @@ void silu(float* x, int size) {
 // pass or block information through the FFN.
 
 void elementwise_mul(float* a, const float* b, int size) {
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t va = vld1q_f32(a + i);
+            float32x4_t vb = vld1q_f32(b + i);
+            vst1q_f32(a + i, vmulq_f32(va, vb));
+        }
+        for (; i < size; i++) {
+            a[i] *= b[i];
+        }
+        return;
+    }
+#endif
+    // Naive path
     for (int i = 0; i < size; i++) {
         a[i] *= b[i];
     }
@@ -246,6 +476,21 @@ void elementwise_mul(float* a, const float* b, int size) {
 // need to learn the "delta" (what to add/modify).
 
 void vec_add(float* out, const float* x, int size) {
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        int i = 0;
+        for (; i + 3 < size; i += 4) {
+            float32x4_t vo = vld1q_f32(out + i);
+            float32x4_t vx = vld1q_f32(x + i);
+            vst1q_f32(out + i, vaddq_f32(vo, vx));
+        }
+        for (; i < size; i++) {
+            out[i] += x[i];
+        }
+        return;
+    }
+#endif
+    // Naive path
     for (int i = 0; i < size; i++) {
         out[i] += x[i];
     }
@@ -253,6 +498,10 @@ void vec_add(float* out, const float* x, int size) {
 
 
 // -------------------- RoPE (Rotary Positional Embeddings) --------------------
+//
+// Not NEON-optimized: uses sin()/cos() which have no NEON equivalent,
+// and the loop is over pairs (32 iterations per head) — too small
+// for NEON to make a meaningful difference.
 //
 // Let's walk through what happens with a concrete example.
 //
@@ -373,6 +622,11 @@ void rope(float* q, float* k, int pos, int head_dim,
 //
 //
 // attention is always from the perspective of the token being processed right now. When we're at position 3 processing "sat", the query belongs to "sat". We compare "sat"'s query against every cached key to find out which past tokens are relevant **to "sat"**.
+//
+// NEON optimization: The dot products in attention (q·k and att·v) use
+// the same NEON FMA pattern as matmul. head_dim is 64, so we process
+// 16 floats per iteration = 4 iterations per dot product.
+
 void attention(float* out, const float* q, const float* k, const float* v,
                float* key_cache, float* value_cache, float* att,
                int layer, int pos, const llama_config_t& cfg) {
@@ -417,10 +671,17 @@ void attention(float* out, const float* q, const float* k, const float* v,
     // These will stay in the cache for all future tokens.
     // When position 50 is processed later, it can look back and see what we stored here.
 
-    for (int i = 0; i < kv_dim; i++) {
-        k_cache_pos[i] = k[i];
-        v_cache_pos[i] = v[i];
-    }
+
+    // memcpy is a library function that's been hand-optimized by the platform developers (Apple, in your case).
+    // Under the hood it uses the widest possible memory operations available —
+    // on your M2, it'll use 128-bit or even larger transfers to copy the whole block in far fewer operations. 
+    // It also handles alignment and cache-line considerations that a naive loop doesn't.
+    // For 256 floats (1KB), the difference is small in absolute terms. 
+    // But this copy happens every token, every layer (22 times), twice (keys and values) — 
+    // so 44 memcpy calls per token. It's a minor win but a free one.
+
+    std::memcpy(k_cache_pos, k, static_cast<size_t>(kv_dim) * sizeof(float));
+    std::memcpy(v_cache_pos, v, static_cast<size_t>(kv_dim) * sizeof(float));
 
     // ---- Step 2: For each query head, compute attention ----
 
@@ -439,21 +700,53 @@ void attention(float* out, const float* q, const float* k, const float* v,
         // For each cached position (0 through pos), compute:
         //   score = dot(q_head, cached_key) * scale
         //
-        // This tells us "how relevant is position t to the current token?"
+        // This tells us "how relevant is position p to the current token?"
 
         for (int p = 0; p <= pos; p++) {
             // Pointer to the cached key at position p, KV head kvh
             const float* k_cached = key_cache + layer_offset + p * kv_dim + kvh * head_dim;
 
-            // Dot product of q_head and k_cached (both are 64 floats)
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                score += q_head[d] * k_cached[d];
-            }
+#ifdef __ARM_NEON
+            if (g_backend == Backend::NEON) {
+                // NEON dot product for attention score
+                // head_dim = 64: processes 16 per iteration = 4 iterations total
+                float32x4_t s0 = vdupq_n_f32(0.0f);
+                float32x4_t s1 = vdupq_n_f32(0.0f);
+                float32x4_t s2 = vdupq_n_f32(0.0f);
+                float32x4_t s3 = vdupq_n_f32(0.0f);
 
-            // High score = "these two tokens are very relevant to each other." 
-            // Low score = "not relevant."
-            att[p] = score * scale;
+                int d = 0;
+                for (; d + 15 < head_dim; d += 16) {
+                    s0 = vfmaq_f32(s0, vld1q_f32(q_head + d),      vld1q_f32(k_cached + d));
+                    s1 = vfmaq_f32(s1, vld1q_f32(q_head + d + 4),  vld1q_f32(k_cached + d + 4));
+                    s2 = vfmaq_f32(s2, vld1q_f32(q_head + d + 8),  vld1q_f32(k_cached + d + 8));
+                    s3 = vfmaq_f32(s3, vld1q_f32(q_head + d + 12), vld1q_f32(k_cached + d + 12));
+                }
+
+                float score = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1),
+                                                   vaddq_f32(s2, s3)));
+                // Scalar tail
+                for (; d < head_dim; d++) {
+                    score += q_head[d] * k_cached[d];
+                }
+
+                // High score = "these two tokens are very relevant to each other." 
+                // Low score = "not relevant."
+                att[p] = score * scale;
+            } else {
+#endif
+                // Dot product of q_head and k_cached (both are 64 floats)
+                float score = 0.0f;
+                for (int d = 0; d < head_dim; d++) {
+                    score += q_head[d] * k_cached[d];
+                }
+
+                // High score = "these two tokens are very relevant to each other." 
+                // Low score = "not relevant."
+                att[p] = score * scale;
+#ifdef __ARM_NEON
+            }
+#endif
         }
 
         // ---- Step 2b: Softmax the scores into attention weights ----
@@ -477,21 +770,58 @@ void attention(float* out, const float* q, const float* k, const float* v,
         // Head 0 → out[0..63], head 1 → out[64..127], etc.
         float* out_head = out + qh * head_dim;
 
-        // Zero out first (we're accumulating a sum)
-        for (int d = 0; d < head_dim; d++) {
-            out_head[d] = 0.0f;
-        }
-
-        // Accumulate weighted values
-        for (int t = 0; t <= pos; t++) {
-            // Pointer to cached value at position t, KV head kvh
-            const float* v_cached = value_cache + layer_offset + t * kv_dim + kvh * head_dim;
-
-            float weight = att[t];
-            for (int d = 0; d < head_dim; d++) {
-                out_head[d] += weight * v_cached[d];
+#ifdef __ARM_NEON
+        if (g_backend == Backend::NEON) {
+            // Zero the output for this head
+            {
+                int d = 0;
+                float32x4_t zero = vdupq_n_f32(0.0f);
+                for (; d + 3 < head_dim; d += 4) {
+                    vst1q_f32(out_head + d, zero);
+                }
+                for (; d < head_dim; d++) {
+                    out_head[d] = 0.0f;
+                }
             }
+
+            // Accumulate weighted values
+            for (int t = 0; t <= pos; t++) {
+                // Pointer to cached value at position t, KV head kvh
+                const float* v_cached = value_cache + layer_offset + t * kv_dim + kvh * head_dim;
+                // Broadcast the attention weight to all 4 NEON lanes
+                float32x4_t w = vdupq_n_f32(att[t]);
+
+                int d = 0;
+                for (; d + 3 < head_dim; d += 4) {
+                    float32x4_t o = vld1q_f32(out_head + d);
+                    float32x4_t val = vld1q_f32(v_cached + d);
+                    o = vfmaq_f32(o, w, val);    // out += weight * value
+                    vst1q_f32(out_head + d, o);
+                }
+                for (; d < head_dim; d++) {
+                    out_head[d] += att[t] * v_cached[d];
+                }
+            }
+        } else {
+#endif
+            // Zero out first (we're accumulating a sum)
+            for (int d = 0; d < head_dim; d++) {
+                out_head[d] = 0.0f;
+            }
+
+            // Accumulate weighted values
+            for (int t = 0; t <= pos; t++) {
+                // Pointer to cached value at position t, KV head kvh
+                const float* v_cached = value_cache + layer_offset + t * kv_dim + kvh * head_dim;
+
+                float weight = att[t];
+                for (int d = 0; d < head_dim; d++) {
+                    out_head[d] += weight * v_cached[d];
+                }
+            }
+#ifdef __ARM_NEON
         }
+#endif
     }
     // At this point, out[0..2047] contains the concatenated output of all 32 heads.
     // Next step (outside this function): multiply by W_o to project back.
