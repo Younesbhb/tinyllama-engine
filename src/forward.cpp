@@ -17,11 +17,31 @@
 // These numbers were learned during training.
 static void embed_token(float* out, const GGUFModel& model, int token) {
     const auto& t = model.tensor_info("token_embd.weight");
+    /*
+    This gets a pointer to where the embedding table starts in the memory-mapped file. 
+    It comes back as uint8_t* (raw bytes) because at this point we don't know what 
+    format the data is in — could be F16, F32, Q8_0, etc.
+    */
     const std::uint8_t* data = model.tensor_bytes(t);
+    // This is 2048 — the embedding dimension. Each token's embedding is a row of 2048 numbers.
     int n_embd = static_cast<int>(model.config().n_embd);
 
     if (t.type == GGML_TYPE_F16) {
+        // Now we know the type is F16, so we tell the compiler "treat these raw bytes as 16-bit values." 
+        // The pointer emb points to the same memory address as data, 
+        // but now the compiler knows each element is 2 bytes. 
         const std::uint16_t* emb = reinterpret_cast<const std::uint16_t*>(data);
+        /*
+        This jumps to the right row in the embedding table. The table is a grid:
+        ```
+        Row 0     (token "<unk>"):  [2048 F16 values]
+        Row 1     (token "<s>"):    [2048 F16 values]
+        Row 2     (token "</s>"):   [2048 F16 values]
+        ...
+        Row 15043 (token "Hello"):  [2048 F16 values]   ← if token = 15043
+        ...
+        Row 31999:                  [2048 F16 values]
+        */
         const std::uint16_t* row = emb + static_cast<std::size_t>(token) * n_embd;
         for (int i = 0; i < n_embd; i++) {
             out[i] = fp16_to_f32(row[i]);
@@ -31,6 +51,41 @@ static void embed_token(float* out, const GGUFModel& model, int token) {
         const float* row = emb + static_cast<std::size_t>(token) * n_embd;
         for (int i = 0; i < n_embd; i++) {
             out[i] = row[i];
+        }
+    } else if (t.type == GGML_TYPE_Q8_0) {
+        // Each row is (n_embd / 32) blocks, each block is 34 bytes
+        // To find row 'token': skip token * blocks_per_row blocks
+        int blocks_per_row = n_embd / QK8_0;
+        const block_q8_0* blocks = reinterpret_cast<const block_q8_0*>(data);
+        const block_q8_0* row = blocks + static_cast<std::size_t>(token) * blocks_per_row;
+
+        // Dequantize: for each block, multiply int8 values by the block's scale
+        // For each block in a certain row 
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = fp16_to_f32(row[b].d);
+            // For each weight loop
+            for (int j = 0; j < QK8_0; j++) {
+                out[b * QK8_0 + j] = static_cast<float>(row[b].qs[j]) * scale;
+            }
+        }
+    } else if (t.type == GGML_TYPE_Q4_0) {
+        // Each row is (n_embd / 32) blocks, each block is 18 bytes
+        int blocks_per_row = n_embd / QK4_0;
+        const block_q4_0* blocks = reinterpret_cast<const block_q4_0*>(data);
+        const block_q4_0* row = blocks + static_cast<std::size_t>(token) * blocks_per_row;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = fp16_to_f32(row[b].d);
+            int base_idx = b * QK4_0;
+            for (int j = 0; j < QK4_0 / 2; j++) {
+                // Low nibble → element j (first 16 of the block)
+                int v0 = static_cast<int>(row[b].qs[j] & 0x0F) - 8;
+                // High nibble → element j + 16 (second 16 of the block)
+                int v1 = static_cast<int>(row[b].qs[j] >> 4) - 8;
+
+                out[base_idx + j]              = static_cast<float>(v0) * scale;
+                out[base_idx + j + QK4_0 / 2]  = static_cast<float>(v1) * scale;
+            }
         }
     } else {
         throw std::runtime_error("Unsupported embedding type");

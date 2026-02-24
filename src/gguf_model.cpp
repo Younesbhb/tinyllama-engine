@@ -43,18 +43,36 @@ static std::uint64_t align_up(std::uint64_t x, std::uint64_t a) {
 
 static const char* ggml_type_name(ggml_type t) {
     switch (t) {
-        case GGML_TYPE_F32: return "F32";
-        case GGML_TYPE_F16: return "F16";
+        case GGML_TYPE_F32:  return "F32";
+        case GGML_TYPE_F16:  return "F16";
+        case GGML_TYPE_Q8_0: return "Q8_0";
+        case GGML_TYPE_Q4_0: return "Q4_0";
         default: return "OTHER";
     }
 }
 
-static std::uint64_t bytes_per_element(ggml_type t) {
+// Compute the total byte size of a tensor given its element count and type.
+// For F32/F16 this is simple: n_elems × bytes_per_element.
+// For quantized types, weights are stored in blocks of 32 elements,
+// so we compute: (n_elems / 32) × bytes_per_block.
+static std::uint64_t tensor_byte_size(std::uint64_t n_elems, ggml_type t) {
     switch (t) {
-        case GGML_TYPE_F32: return 4;
-        case GGML_TYPE_F16: return 2;
+        case GGML_TYPE_F32: return n_elems * 4;
+        case GGML_TYPE_F16: return n_elems * 2;
+        case GGML_TYPE_Q8_0: {
+            // 34 bytes per block of 32 elements
+            if (n_elems % QK8_0 != 0)
+                throw std::runtime_error("Q8_0 tensor size not a multiple of 32");
+            return (n_elems / QK8_0) * sizeof(block_q8_0);
+        }
+        case GGML_TYPE_Q4_0: {
+            // 18 bytes per block of 32 elements
+            if (n_elems % QK4_0 != 0)
+                throw std::runtime_error("Q4_0 tensor size not a multiple of 32");
+            return (n_elems / QK4_0) * sizeof(block_q4_0);
+        }
         default:
-            throw std::runtime_error("Unsupported ggml_type for now (only F16/F32 supported).");
+            throw std::runtime_error("Unsupported ggml_type for byte size calculation.");
     }
 }
 
@@ -499,11 +517,8 @@ void GGUFModel::parse() {
         }
         t.n_elems = n;
 
-        // compute byte_size
-        std::uint64_t bpe = bytes_per_element(t.type);
-        if (n > std::numeric_limits<std::uint64_t>::max() / bpe)
-            throw std::runtime_error("byte_size overflow: " + t.name);
-        t.byte_size = n * bpe;
+        // compute byte_size (handles both per-element and block-based types)
+        t.byte_size = tensor_byte_size(n, t.type);
 
         // alignment check (offset is relative to tensor_data_start)
         if (t.offset % alignment_ != 0) {
@@ -525,4 +540,3 @@ void GGUFModel::parse() {
     }
     
 }
-

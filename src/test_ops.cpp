@@ -635,6 +635,142 @@ void test_sampling() {
 }
 
 
+void test_matmul_q8_0() {
+    std::cout << "\n=== matmul_q8_0 ===\n";
+
+    // Test 1: Simple case — 1 row, 32 columns (1 block)
+    // scale = 1.0 (F16 = 0x3C00), all qs = 2, x = all 1.0
+    // Expected: 1.0 * (2*1 + 2*1 + ... 32 times) = 1.0 * 64 = 64.0
+    {
+        block_q8_0 block;
+        block.d = 0x3C00;  // 1.0 in F16
+        for (int i = 0; i < QK8_0; i++) block.qs[i] = 2;
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul_q8_0(&out, &block, x, 1, 32);
+        std::cout << "    Q8_0 simple: " << out << " (expected 64.0)\n";
+        check("Q8_0 scale=1.0, qs=2, x=1 → 64.0", approx_equal(out, 64.0f, 0.1f));
+    }
+
+    // Test 2: scale = 0.5 (F16 = 0x3800), qs = 0,1,2,...,31, x = all 1.0
+    // Expected: 0.5 * (0+1+2+...+31) = 0.5 * 496 = 248.0
+    {
+        block_q8_0 block;
+        block.d = 0x3800;  // 0.5 in F16
+        for (int i = 0; i < QK8_0; i++) block.qs[i] = static_cast<std::int8_t>(i);
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul_q8_0(&out, &block, x, 1, 32);
+        std::cout << "    Q8_0 sequential: " << out << " (expected 248.0)\n";
+        check("Q8_0 scale=0.5, qs=0..31, x=1 → 248.0", approx_equal(out, 248.0f, 0.5f));
+    }
+
+    // Test 3: Two rows, 64 columns (2 blocks per row)
+    // Row 0: both blocks scale=1.0, qs=1 → dot with x=1 → 32+32 = 64
+    // Row 1: both blocks scale=2.0 (0x4000), qs=1 → dot with x=1 → 2*(32)+2*(32) = 128
+    {
+        block_q8_0 blocks[4]; // 2 rows × 2 blocks
+        // Row 0
+        blocks[0].d = 0x3C00; // 1.0
+        blocks[1].d = 0x3C00;
+        for (int i = 0; i < QK8_0; i++) { blocks[0].qs[i] = 1; blocks[1].qs[i] = 1; }
+        // Row 1
+        blocks[2].d = 0x4000; // 2.0
+        blocks[3].d = 0x4000;
+        for (int i = 0; i < QK8_0; i++) { blocks[2].qs[i] = 1; blocks[3].qs[i] = 1; }
+
+        float x[64];
+        for (int i = 0; i < 64; i++) x[i] = 1.0f;
+
+        float out[2] = {0};
+        matmul_q8_0(out, blocks, x, 2, 64);
+        std::cout << "    Q8_0 2-row: [" << out[0] << ", " << out[1] << "] (expected [64, 128])\n";
+        check("Q8_0 two rows: row 0 = 64", approx_equal(out[0], 64.0f, 0.5f));
+        check("Q8_0 two rows: row 1 = 128", approx_equal(out[1], 128.0f, 0.5f));
+    }
+
+    // Test 4: Dispatch through matmul() with GGML_TYPE_Q8_0
+    {
+        block_q8_0 block;
+        block.d = 0x3C00; // scale = 1.0
+        for (int i = 0; i < QK8_0; i++) block.qs[i] = 3;
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul(&out, &block, x, 1, 32, GGML_TYPE_Q8_0);
+        check("Q8_0 dispatch through matmul()", approx_equal(out, 96.0f, 0.5f));
+    }
+}
+
+
+void test_matmul_q4_0() {
+    std::cout << "\n=== matmul_q4_0 ===\n";
+
+    // Test 1: Simple case — 1 row, 32 columns (1 block)
+    // scale = 1.0 (F16 = 0x3C00)
+    // All nibbles = 9, so value = 9 - 8 = 1
+    // x = all 1.0
+    // Expected: 1.0 * (1*1 × 32 times) = 32.0
+    {
+        block_q4_0 block;
+        block.d = 0x3C00; // 1.0 in F16
+        // Each byte: low nibble = 9, high nibble = 9 → byte = 0x99
+        for (int i = 0; i < QK4_0 / 2; i++) block.qs[i] = 0x99;
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul_q4_0(&out, &block, x, 1, 32);
+        std::cout << "    Q4_0 simple: " << out << " (expected 32.0)\n";
+        check("Q4_0 all nibbles=9 (val=1), x=1 → 32.0", approx_equal(out, 32.0f, 0.5f));
+    }
+
+    // Test 2: Mixed values
+    // scale = 2.0 (F16 = 0x4000)
+    // All nibbles = 8 → value = 8 - 8 = 0
+    // x = all 1.0 → expected 0.0
+    {
+        block_q4_0 block;
+        block.d = 0x4000; // 2.0
+        for (int i = 0; i < QK4_0 / 2; i++) block.qs[i] = 0x88;
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul_q4_0(&out, &block, x, 1, 32);
+        std::cout << "    Q4_0 zero values: " << out << " (expected 0.0)\n";
+        check("Q4_0 all nibbles=8 (val=0) → 0.0", approx_equal(out, 0.0f, 0.5f));
+    }
+
+    // Test 3: Dispatch through matmul()
+    {
+        block_q4_0 block;
+        block.d = 0x3C00; // scale = 1.0
+        // Low nibble = 10 (val=2), high nibble = 10 (val=2) → byte = 0xAA
+        for (int i = 0; i < QK4_0 / 2; i++) block.qs[i] = 0xAA;
+
+        float x[32];
+        for (int i = 0; i < 32; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul(&out, &block, x, 1, 32, GGML_TYPE_Q4_0);
+        // 32 elements, each value = 2, x = 1 → 1.0 * (2*32) = 64.0
+        std::cout << "    Q4_0 dispatch: " << out << " (expected 64.0)\n";
+        check("Q4_0 dispatch through matmul()", approx_equal(out, 64.0f, 0.5f));
+    }
+}
+
+
 // -------------------- main --------------------
 
 int main() {
@@ -643,6 +779,8 @@ int main() {
 
     test_matmul_f32();
     test_matmul_f16();
+    test_matmul_q8_0();
+    test_matmul_q4_0();
     test_rmsnorm();
     test_softmax();
     test_silu();
@@ -662,7 +800,7 @@ int main() {
         std::cout << "⚠ Some tests failed!\n";
         return 1;
     } else {
-        std::cout << "✓ All tests passed! Ready for Phase 6 (Generation Loop).\n";
+        std::cout << "✓ All tests passed!\n";
         return 0;
     }
 }

@@ -109,7 +109,7 @@ void matmul_f32(float* out, const float* W, const float* x,
 
             // 4 independent accumulator registers — each holds 4 partial sums.
             // By using 4 separate accumulators, the CPU can pipeline the FMA
-            // instructions without waiting for the previous result.
+            // instructions without waiting for the previous result.            
             // vdupq_n_f32(val): Create a register with all 4 slots set to val
             float32x4_t sum0 = vdupq_n_f32(0.0f);  // [0, 0, 0, 0]
             float32x4_t sum1 = vdupq_n_f32(0.0f);
@@ -271,9 +271,300 @@ void matmul_f16(float* out, const std::uint16_t* W, const float* x,
 }
 
 
+// -------------------- Matrix-Vector Multiply (Q8_0 weights) --------------------
+//
+// Q8_0 quantization: weights are stored in blocks of 32.
+// Each block has one F16 scale factor and 32 int8 values.
+//
+// To get the real float weight: float_value = int8_value * scale
+//
+// Memory layout of one row with 2048 columns:
+//   [block 0 (34 bytes)][block 1 (34 bytes)]...[block 63 (34 bytes)]
+//   2048 / 32 = 64 blocks per row, 64 × 34 = 2176 bytes per row
+//   Compare to F16: 2048 × 2 = 4096 bytes per row (~1.88× smaller)
+//
+// The key insight for performance: we can compute the dot product of
+// the 32 int8 values with the 32 input floats FIRST, then multiply
+// by the scale once at the end. This means only 1 fp16_to_f32 call
+// per block instead of 32.
+//
+// NEON optimization: load 8 int8s at a time, widen to float32, FMA.
+// Per block of 32 elements: 4 iterations of 8 elements each.
+
+void matmul_q8_0(float* out, const block_q8_0* W, const float* x,
+                 int rows, int cols) {
+    int blocks_per_row = cols / QK8_0;
+
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        for (int i = 0; i < rows; i++) {
+            const block_q8_0* row_blocks = W + i * blocks_per_row;
+            float sum = 0.0f;
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                // row_blocks[b] gets you the current block b at a certain row
+                float scale = fp16_to_f32(row_blocks[b].d);
+                // Pointer to the weights 
+                const std::int8_t* qs = row_blocks[b].qs;
+                const float* xb = x + b * QK8_0;
+
+                // Two accumulators for the dot product within this block
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+                // Process 8 elements per iteration, 4 iterations for 32 elements
+                for (int j = 0; j < QK8_0; j += 8) {
+                    // Load 8 int8 values
+                    int8x8_t raw = vld1_s8(qs + j);
+                    /*
+                    We have 8 numbers but they're tiny integers. We can't multiply them with floats yet. 
+                    NEON has no instruction that multiplies int8 directly with float32. 
+                    We need to gradually widen them until they're floats.
+                    What we are doing is :
+                    int8 (8-bit) → int16 (16-bit) → int32 (32-bit) → float32 (32-bit)
+                    */
+
+                    // Widen int8 → int16 (8 values)
+                    int16x8_t wide = vmovl_s8(raw);
+
+                    // Split into two groups of 4 and widen to int32 → float32
+                    //   vget_low_s16:  first 4 int16 values
+                    //   vmovl_s16:     int16 → int32 (4 values)
+                    //   vcvtq_f32_s32: int32 → float32 (4 values)
+                    float32x4_t flo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(wide)));
+                    float32x4_t fhi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(wide)));
+
+                    // Load 8 input values (already float32)
+                    float32x4_t x0 = vld1q_f32(xb + j);
+                    float32x4_t x1 = vld1q_f32(xb + j + 4);
+
+                    // FMA: accumulate int8_as_float * input
+                    acc0 = vfmaq_f32(acc0, flo, x0);
+                    acc1 = vfmaq_f32(acc1, fhi, x1);
+                }
+
+                // Horizontal sum of the block's dot product, then multiply by scale
+                float block_dot = vaddvq_f32(vaddq_f32(acc0, acc1));
+                sum += scale * block_dot;
+            }
+
+            out[i] = sum;
+        }
+        return;
+    }
+#endif
+    // Naive path
+    
+    // For each row loop
+    for (int i = 0; i < rows; i++) {
+        const block_q8_0* row_blocks = W + i * blocks_per_row;
+        float sum = 0.0f;
+
+        // For each block loop
+        for (int b = 0; b < blocks_per_row; b++) {
+            // Convert scale from F16 to F32 (once per block of 32 weights)
+            // row_blocks[b] gets you the current block b at a certain row
+            float scale = fp16_to_f32(row_blocks[b].d);
+            const std::int8_t* qs = row_blocks[b].qs;
+            const float* xb = x + b * QK8_0;
+
+            // Dot product of 32 int8 values with 32 float inputs
+            float block_sum = 0.0f;
+            // For each weight loop
+            for (int j = 0; j < QK8_0; j++) {
+                block_sum += static_cast<float>(qs[j]) * xb[j];
+            }
+
+            // Multiply the dot product by the block's scale
+            sum += scale * block_sum;
+        }
+
+        out[i] = sum;
+    }
+}
+
+
+// -------------------- Matrix-Vector Multiply (Q4_0 weights) --------------------
+//
+// Q4_0 quantization: weights are stored in blocks of 32.
+// Each block has one F16 scale factor and 16 bytes of packed 4-bit values.
+//
+// Two values are packed into each byte:
+//   byte[j] low nibble  (byte & 0x0F) → element j        (first 16 elements)
+//   byte[j] high nibble (byte >> 4)    → element j + 16   (second 16 elements)
+//
+// The raw 4-bit value is unsigned (0-15). Subtract 8 to get signed range (-8 to +7).
+// Final weight: float_value = (nibble - 8) * scale
+//
+// Memory: 18 bytes per block of 32 weights
+//   2048 / 32 = 64 blocks per row, 64 × 18 = 1152 bytes per row
+//   Compare to F16: 4096 bytes → ~3.56× smaller
+//
+// NEON optimization: load all 16 bytes, extract low/high nibbles with
+// masking and shifting, convert to float, FMA with input values.
+
+void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
+                 int rows, int cols) {
+    int blocks_per_row = cols / QK4_0;
+
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        for (int i = 0; i < rows; i++) {
+            const block_q4_0* row_blocks = W + i * blocks_per_row;
+            float sum = 0.0f;
+
+            for (int b = 0; b < blocks_per_row; b++) {
+                float scale = fp16_to_f32(row_blocks[b].d);
+                const std::uint8_t* qs = row_blocks[b].qs;
+                const float* xb = x + b * QK4_0;
+
+                float32x4_t acc0 = vdupq_n_f32(0.0f);
+                float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+                // Load all 16 packed bytes at once
+                // vld1q_u8(ptr): Load 16 uint8 values from memory into a 128-bit register
+                uint8x16_t raw = vld1q_u8(qs);
+                
+                // There are 32 nibbles total. Each byte has 2 nibbles, and we have 16 bytes:
+                // 16 bytes × 2 nibbles per byte = 32 nibbles = 32 weights.
+                // 1 nibble - > 0000
+
+                /*
+                All 16 bytes laid out:
+                byte[0]:  low nibble → weight 0,    high nibble → weight 16
+                byte[1]:  low nibble → weight 1,    high nibble → weight 17
+                byte[2]:  low nibble → weight 2,    high nibble → weight 18
+                ...
+                byte[15]: low nibble → weight 15,   high nibble → weight 31
+                */
+
+                // Extract low nibbles → elements 0-15
+                /*
+                vdupq_n_u8(val): Fill a 128-bit register with the same uint8 value in all 16 slots.
+                vandq_u8(a, b): Bitwise AND between two registers, 16 bytes at once
+                */
+                uint8x16_t lo_nibbles = vandq_u8(raw, vdupq_n_u8(0x0F));
+
+                // Extract high nibbles → elements 16-31
+                // vshrq_n_u8(a, 4): Shift every byte right by 4 bits
+                uint8x16_t hi_nibbles = vshrq_n_u8(raw, 4);
+
+                // We can only widen 8 values at a time (64-bit → 128-bit), so we split the 16 low nibbles:
+                // ---- Process first 16 elements (low nibbles) ----
+                // Split into two halves of 8
+                // vget_low_u8(a): Take the first 8 bytes from a 16-byte register. 128-bit → 64-bit (lower half)
+                // vget_high_u8(a): Take the last 8 bytes from a 16-byte register. 128-bit → 64-bit (upper half)
+                uint8x8_t lo_a = vget_low_u8(lo_nibbles);    // elements 0-7
+                uint8x8_t lo_b = vget_high_u8(lo_nibbles);   // elements 8-15
+
+                // Objective here: Widen uint8 → int16, subtract 8 to center (unsigned 0-15 → signed -8 to +7)
+                // vmovl_u8(a): Widen 8 uint8 → 8 uint16 (same numbers, bigger containers) 64-bit → 128-bit
+                // `vreinterpretq_s16_u16(...)` — tell the compiler "treat these as signed int16 now". Zero cost, just changes the type label. The bits don't change.
+                // `vsubq_s16(..., 8)` — subtract 8 from each
+                // vsubq_s16(a, b): Subtract two int16 registers element-wise
+                int16x8_t lo16_a = vreinterpretq_s16_u16(vmovl_u8(lo_a));
+                lo16_a = vsubq_s16(lo16_a, vdupq_n_s16(8));
+                int16x8_t lo16_b = vreinterpretq_s16_u16(vmovl_u8(lo_b));
+                lo16_b = vsubq_s16(lo16_b, vdupq_n_s16(8));
+
+                // Elements 0-3: int16 → int32 → float32, FMA with x[0..3]
+                // vget_low_s16(a): Take first 4 int16 values from an 8-value register. 128-bit → 64-bit (lower half)
+                // vmovl_s16(a): Widen 4 int16 → 4 int32. 64-bit → 128-bit
+                // vcvtq_f32_s32(a): Convert 4 int32 → 4 float32. Integer to floating point
+                float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_a)));
+                // // Multiply with input floats and accumulate
+                acc0 = vfmaq_f32(acc0, f0, vld1q_f32(xb));
+
+                // Elements 4-7
+                // vget_high_s16(a): Take last 4 int16 values from an 8-value register. 128-bit → 64-bit (upper half)
+                float32x4_t f1 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_a)));
+                acc1 = vfmaq_f32(acc1, f1, vld1q_f32(xb + 4));
+
+                // Elements 8-11
+                float32x4_t f2 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_b)));
+                acc0 = vfmaq_f32(acc0, f2, vld1q_f32(xb + 8));
+
+                // Elements 12-15
+                float32x4_t f3 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16_b)));
+                acc1 = vfmaq_f32(acc1, f3, vld1q_f32(xb + 12));
+
+                // ---- Process second 16 elements (high nibbles) ----
+                uint8x8_t hi_a = vget_low_u8(hi_nibbles);    // elements 16-23
+                uint8x8_t hi_b = vget_high_u8(hi_nibbles);   // elements 24-31
+
+                int16x8_t hi16_a = vreinterpretq_s16_u16(vmovl_u8(hi_a));
+                hi16_a = vsubq_s16(hi16_a, vdupq_n_s16(8));
+                int16x8_t hi16_b = vreinterpretq_s16_u16(vmovl_u8(hi_b));
+                hi16_b = vsubq_s16(hi16_b, vdupq_n_s16(8));
+
+                // Elements 16-19
+                float32x4_t f4 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_a)));
+                acc0 = vfmaq_f32(acc0, f4, vld1q_f32(xb + 16));
+
+                // Elements 20-23
+                float32x4_t f5 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_a)));
+                acc1 = vfmaq_f32(acc1, f5, vld1q_f32(xb + 20));
+
+                // Elements 24-27
+                float32x4_t f6 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16_b)));
+                acc0 = vfmaq_f32(acc0, f6, vld1q_f32(xb + 24));
+
+                // Elements 28-31
+                float32x4_t f7 = vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16_b)));
+                acc1 = vfmaq_f32(acc1, f7, vld1q_f32(xb + 28));
+
+                // Sum up and multiply by scale
+                float block_dot = vaddvq_f32(vaddq_f32(acc0, acc1));
+                sum += scale * block_dot;
+            }
+
+            out[i] = sum;
+        }
+        return;
+    }
+#endif
+    // Naive path
+    for (int i = 0; i < rows; i++) {
+        const block_q4_0* row_blocks = W + i * blocks_per_row;
+        float sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            float scale = fp16_to_f32(row_blocks[b].d);
+            const std::uint8_t* qs = row_blocks[b].qs;
+            const float* xb = x + b * QK4_0;
+
+            float block_sum = 0.0f;
+            for (int j = 0; j < QK4_0 / 2; j++) {
+                // Low nibble → element j (first 16 elements)
+                int v0 = static_cast<int>(qs[j] & 0x0F) - 8;
+                // High nibble → element j + 16 (second 16 elements)
+                int v1 = static_cast<int>(qs[j] >> 4) - 8;
+
+                block_sum += static_cast<float>(v0) * xb[j];
+                /*
+                Why j and j + QK4_0 / 2?
+                The 32 weights in a block are split into two halves. All low nibbles are the first 16 elements, all high nibbles are the second 16:
+                qs[0]:  low nibble → element 0,    high nibble → element 16
+                qs[1]:  low nibble → element 1,    high nibble → element 17
+                qs[2]:  low nibble → element 2,    high nibble → element 18
+                ...
+                qs[15]: low nibble → element 15,   high nibble → element 31
+                That's why the loop runs j = 0 to 15 (QK4_0 / 2 = 16 iterations), and the low nibble weight multiplies with xb[j] (elements 0–15) while the high nibble weight multiplies with xb[j + 16] (elements 16–31).
+                */
+                block_sum += static_cast<float>(v1) * xb[j + QK4_0 / 2];
+            }
+
+            sum += scale * block_sum;
+        }
+
+        out[i] = sum;
+    }
+}
+
+
 // -------------------- Matrix-Vector Multiply (type dispatch) --------------------
 //
-// This is the function you'll call in the forward pass.
+// This is the function called in the forward pass.
 // It dispatches to the correct typed implementation based on the
 // ggml_type stored in the tensor info.
 
@@ -286,10 +577,15 @@ void matmul(float* out, const void* W, const float* x,
         case GGML_TYPE_F16:
             matmul_f16(out, static_cast<const std::uint16_t*>(W), x, rows, cols);
             break;
+        case GGML_TYPE_Q8_0:
+            matmul_q8_0(out, static_cast<const block_q8_0*>(W), x, rows, cols);
+            break;
+        case GGML_TYPE_Q4_0:
+            matmul_q4_0(out, static_cast<const block_q4_0*>(W), x, rows, cols);
+            break;
         default:
             throw std::runtime_error(
-                "matmul: unsupported weight type (only F16/F32 for now). "
-                "Quantized types (Q4_0, Q8_0) will be added in Phase 9.");
+                "matmul: unsupported weight type.");
     }
 }
 

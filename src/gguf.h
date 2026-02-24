@@ -21,11 +21,75 @@ enum gguf_type : std::uint32_t {
 };
 
 enum ggml_type : std::uint32_t {
-    GGML_TYPE_F32 = 0,
-    GGML_TYPE_F16 = 1,
-    // many others exist; we intentionally treat them as "unsupported" for now
+    GGML_TYPE_F32  = 0,
+    GGML_TYPE_F16  = 1,
+    GGML_TYPE_Q4_0 = 2,
+    GGML_TYPE_Q4_1 = 3,   // not implemented, listed for correct numbering
+    // gap: 4-6 are other types we don't use
+    GGML_TYPE_Q8_0 = 8,
     GGML_TYPE_COUNT = 40
 };
+
+// -------------------- Quantization Block Structures --------------------
+//
+// Quantized weights are stored in blocks of 32 elements.
+// Each block has a scale factor (F16) and compressed integer values.
+// To dequantize: float_value = integer_value * scale
+//
+// This is how the model shrinks from 2.2GB (F16) to 1.17GB (Q8_0)
+// or 637MB (Q4_0) — the weights are stored as small integers instead
+// of 16-bit floats.
+
+// Q8_0: 8-bit quantization
+// Each block: 2 bytes (scale) + 32 bytes (32 × int8) = 34 bytes
+// Stores 32 weights in 34 bytes vs 64 bytes for F16 → ~1.88× compression
+//
+// The scale is the maximum absolute value in the block divided by 127.
+// Each int8 value is the original weight divided by scale, rounded.
+//
+// Block size just means how many weights are grouped together and share one scale factor.
+// For both Q8_0 and Q4_0, the block size is 32.
+static constexpr int QK8_0 = 32;  // block size
+
+struct block_q8_0 {
+    /*
+    d — The scale factor, stored as F16 (2 bytes). 
+    When the model was quantized, whoever made the file took each group of 32 weights,
+    found the range, and computed a scale so that dividing every weight by this scale fits
+    into -128 to +127. For example, if the 32 weights range from -0.5 to +0.5, 
+    the scale might be 0.004 (0.5 / 127 ≈ 0.004).
+    */
+    std::uint16_t d;       // scale factor stored as F16 (2 bytes)
+    /*
+    qs[32] — The 32 quantized weights as signed 8-bit integers. 
+    Each one ranges from -128 to +127. To get the real float value: float_weight = qs[j] * fp16_to_f32(d).
+    For example, if qs[5] is 63 and the scale is 0.004, the real weight is 63 × 0.004 = 0.252.
+    */
+    std::int8_t   qs[QK8_0]; // quantized values: 32 × int8 (32 bytes)
+};
+// Total: 34 bytes for 32 weights
+static_assert(sizeof(block_q8_0) == 34, "Q8_0 block must be 34 bytes");
+
+// Q4_0: 4-bit quantization
+// Each block: 2 bytes (scale) + 16 bytes (32 × int4 packed) = 18 bytes
+// Stores 32 weights in 18 bytes vs 64 bytes for F16 → ~3.56× compression
+//
+// Two 4-bit values are packed into each byte:
+//   byte = (high_nibble << 4) | low_nibble
+// The raw nibble range is 0-15; subtract 8 to get signed range -8 to +7.
+//
+// The block size of 32 for Q8_0 and Q4_0 is defined in the llama.cpp source code,
+// which is the reference implementation that created the GGML/GGUF format. 
+// Specifically in their ggml-common.h:
+
+static constexpr int QK4_0 = 32;  // block size
+
+struct block_q4_0 {
+    std::uint16_t d;          // scale factor stored as F16 (2 bytes)
+    std::uint8_t  qs[QK4_0 / 2]; // quantized values: 16 bytes (2 values per byte)
+};
+// Total: 18 bytes for 32 weights
+static_assert(sizeof(block_q4_0) == 18, "Q4_0 block must be 18 bytes");
 
 
 // Model configuration extracted from GGUF metadata
