@@ -54,192 +54,58 @@
 // And remember, during attention, each KV head is shared by 8 query heads (32 query heads ÷ 4 KV heads = 8). So query heads 0–7 all attend against KV head 0's keys and values, query heads 8–15 against KV head 1, and so on. The 8 query heads within each group ask different questions but search through the same set of keys and values. That's the GQA tradeoff — 8× less memory in the KV cache compared to full multi-head attention, with minimal quality loss.
 
 
-// -------------------- Helper: parse and remove a flag --------------------
-// Scans argv for "--flag value", removes both from argv, returns the value.
-// Returns empty string if flag not found.
-static std::string consume_flag(int& argc, char** argv, const char* flag) {
-    for (int i = 1; i < argc - 1; i++) {
-        if (std::strcmp(argv[i], flag) == 0) {
-            std::string val = argv[i + 1];
-            // Shift remaining args left by 2
-            for (int j = i; j < argc - 2; j++) {
-                argv[j] = argv[j + 2];
-            }
-            argc -= 2;
-            return val;
-        }
-    }
-    return "";
-}
-
-// Scans argv for a bare "--flag" (no value), removes it.
-// Returns true if found.
-static bool consume_bare_flag(int& argc, char** argv, const char* flag) {
-    for (int i = 1; i < argc; i++) {
-        if (std::strcmp(argv[i], flag) == 0) {
-            // Shift remaining args left by 1
-            for (int j = i; j < argc - 1; j++) {
-                argv[j] = argv[j + 1];
-            }
-            argc -= 1;
-            return true;
-        }
-    }
-    return false;
-}
-
-
-// -------------------- Interactive chat loop --------------------
-//
-// Wraps user input in TinyLlama's chat template and calls generate()
-// repeatedly. The KV cache accumulates the entire conversation so the
-// model sees full history.
-//
-// TinyLlama chat template:
-//   <|system|>\nYou are a helpful assistant.</s>\n
-//   <|user|>\n{message}</s>\n
-//   <|assistant|>\n
-//
-// The system prompt is sent once on the first turn. Each subsequent
-// turn only adds the user/assistant markers.
-
-static void chat_loop(GGUFModel& model, RunState& state,
-                      int max_tokens, float temperature, float top_p) {
-    const auto& cfg = model.config();
-    int n_ctx = static_cast<int>(cfg.n_ctx);
-
-    std::cout << "\n";
-    std::cout << "=== Interactive Chat ===\n";
-    std::cout << "Type your message and press Enter.\n";
-    std::cout << "Commands:  /quit  /reset\n";
-    std::cout << "\n";
-
-    bool first_turn = true;
-
-    while (true) {
-        std::cout << "> ";
-        std::string user_input;
-        if (!std::getline(std::cin, user_input)) {
-            // EOF (Ctrl+D)
-            std::cout << "\n";
-            break;
-        }
-
-        // Trim whitespace
-        // The npos check handles the case where the input is entirely whitespace — like the user just hit spacebar a few times and pressed Enter
-        // find_first_not_of returns npos (a special "not found" value) because there's no non-whitespace character.
-        size_t start = user_input.find_first_not_of(" \t\n\r");
-        if (start == std::string::npos) continue;  // empty line
-        user_input = user_input.substr(start);
-
-        // Handle commands
-        if (user_input == "/quit" || user_input == "/exit") {
-            break;
-        }
-        if (user_input == "/reset") {
-            state.reset(cfg);
-            first_turn = true;
-            std::cout << "[conversation reset]\n\n";
-            continue;
-        }
-
-        // Build the prompt for this turn
-        std::string prompt;
-        if (first_turn) {
-            // First turn: include system prompt
-            prompt = "<|system|>\nYou are a helpful assistant.</s>\n"
-                     "<|user|>\n" + user_input + "</s>\n"
-                     "<|assistant|>\n";
-            first_turn = false;
-        } else {
-            // Subsequent turns: just user + assistant markers
-            prompt = "<|user|>\n" + user_input + "</s>\n"
-                     "<|assistant|>\n";
-        }
-
-        // Generate response
-        std::cout << "\n";
-        generate(model, state, prompt, max_tokens, temperature, top_p);
-
-        // Display KV cache usage
-        std::cout << "\n[KV cache: " << state.pos << " / " << n_ctx << " tokens]\n\n";
-
-        // Check if context is nearly full (less than 100 tokens remaining)
-        int remaining = n_ctx - state.pos;
-        if (remaining < 100) {
-            std::cout << "[warning: only " << remaining
-                      << " tokens remaining — type /reset to start a new conversation]\n\n";
-        }
-    }
-}
-
 // -------------------- main --------------------
 
 int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::cerr << "Usage:\n"
-                      << "  ./engine <model.gguf> \"prompt\"       (single-shot generation)\n"
-                      << "  ./engine <model.gguf> --chat           (interactive chat)\n"
-                      << "  ./engine <model.gguf> dump <tensor>    (dump tensor values)\n"
+                      << "  ./engine <model.gguf> \"prompt text\"\n"
+                      << "  ./engine <model.gguf>                    (default prompt)\n"
+                      << "  ./engine <model.gguf> dump <tensor> [n]  (dump tensor)\n"
                       << "\nOptions:\n"
-                      << "  --backend naive|neon    Compute backend (default: neon on ARM)\n"
-                      << "  --threads N             Number of threads (default: 1)\n"
-                      << "  --temp T                Temperature (default: 0.7)\n"
-                      << "  --top-p P               Nucleus sampling threshold (default: 0.9)\n"
-                      << "  --max-tokens N          Max tokens to generate (default: 2048)\n";
+                      << "  --backend naive   Use naive (unoptimized) implementations\n"
+                      << "  --backend neon    Use ARM NEON SIMD implementations (default on ARM)\n"
+                      << "  --threads N       Number of threads for matmul (default: 1)\n";
             return 1;
         }
 
-        // ---- Parse flags (order-independent, consumed from argv) ----
-
-        // --backend
-        std::string backend_val = consume_flag(argc, argv, "--backend");
-        if (!backend_val.empty()) {
-            if (backend_val == "naive") {
-                set_backend(Backend::NAIVE);
-            } else if (backend_val == "neon") {
-                set_backend(Backend::NEON);
-            } else {
-                std::cerr << "Unknown backend: " << backend_val << " (use 'naive' or 'neon')\n";
-                return 1;
+        // Parse --backend flag (can appear anywhere in args)
+        for (int i = 1; i < argc - 1; i++) {
+            if (std::strcmp(argv[i], "--backend") == 0) {
+                std::string val = argv[i + 1];
+                if (val == "naive") {
+                    set_backend(Backend::NAIVE);
+                } else if (val == "neon") {
+                    set_backend(Backend::NEON);
+                } else {
+                    std::cerr << "Unknown backend: " << val << " (use 'naive' or 'neon')\n";
+                    return 1;
+                }
+                // Shift remaining args to remove --backend and its value
+                for (int j = i; j < argc - 2; j++) {
+                    argv[j] = argv[j + 2];
+                }
+                argc -= 2;
+                break;
             }
         }
 
-        // --threads
-        std::string threads_val = consume_flag(argc, argv, "--threads");
-        if (!threads_val.empty()) {
-            int n = std::atoi(threads_val.c_str());
-            if (n < 1) n = 1;
-            set_num_threads(n);
+        // Parse --threads flag (can appear anywhere in args)
+        for (int i = 1; i < argc - 1; i++) {
+            if (std::strcmp(argv[i], "--threads") == 0) {
+                int n = std::atoi(argv[i + 1]);
+                if (n < 1) n = 1;
+                set_num_threads(n);
+                // Shift remaining args to remove --threads and its value
+                for (int j = i; j < argc - 2; j++) {
+                    argv[j] = argv[j + 2];
+                }
+                argc -= 2;
+                break;
+            }
         }
 
-        // --temp
-        float temperature = 0.7f;
-        std::string temp_val = consume_flag(argc, argv, "--temp");
-        if (!temp_val.empty()) {
-            temperature = std::atof(temp_val.c_str());
-        }
-
-        // --top-p
-        float top_p = 0.9f;
-        std::string top_p_val = consume_flag(argc, argv, "--top-p");
-        if (!top_p_val.empty()) {
-            top_p = std::atof(top_p_val.c_str());
-        }
-
-        // --max-tokens
-        int max_tokens = 2048;
-        std::string max_tok_val = consume_flag(argc, argv, "--max-tokens");
-        if (!max_tok_val.empty()) {
-            max_tokens = std::atoi(max_tok_val.c_str());
-            if (max_tokens < 1) max_tokens = 2048;
-        }
-
-        // --chat (bare flag, no value)
-        bool chat_mode = consume_bare_flag(argc, argv, "--chat");
-
-        // ---- Load model ----
         std::cout << "Backend: " << (get_backend() == Backend::NEON ? "NEON" : "naive")
                   << " | Threads: " << get_num_threads() << "\n";
 
@@ -251,7 +117,7 @@ int main(int argc, char** argv) {
                   << model.config().n_embd << " dim, "
                   << model.config().n_vocab << " vocab)\n";
 
-        // Handle dump mode
+        // Handle dump mode (keep existing functionality)
         if (argc >= 4 && std::string(argv[2]) == "dump") {
             std::string name = argv[3];
             std::size_t n = 10;
@@ -267,29 +133,20 @@ int main(int argc, char** argv) {
         RunState state;
         state.allocate(model.config());
 
-        // ---- Chat mode ----
-        if (chat_mode) {
-            chat_loop(model, state, max_tokens, temperature, top_p);
-            return 0;
-        }
-
-        // ---- Single-shot mode ----
+        // Get prompt from command line or use default
         std::string prompt;
         if (argc >= 3) {
             prompt = argv[2];
         } else {
-            prompt = "<|system|>\nYou are a helpful assistant.</s>\n"
-                     "<|user|>\nWhat is the meaning of life?</s>\n"
-                     "<|assistant|>\n";
+            // TinyLlama chat template format
+            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nHow are you?</s>\n<|assistant|>\n";
+
         }
 
         std::cout << "Prompt: \"" << prompt << "\"\n";
         std::cout << "Generating...\n\n";
 
-        generate(model, state, prompt, max_tokens, temperature, top_p);
-
-        std::cout << "\n[KV cache: " << state.pos << " / "
-                  << model.config().n_ctx << " tokens]\n";
+        generate(model, state, prompt);
 
         return 0;
     } catch (const std::exception& e) {
