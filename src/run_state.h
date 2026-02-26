@@ -153,6 +153,19 @@ struct RunState {
         std::memset(value_cache, 0, sizeof(float) * cache_size);
     }
 
+    // Reset for a new conversation: zero KV cache, reset position.
+    // Scratch buffers don't need zeroing — they get overwritten every forward pass.
+    // But the KV cache accumulates across tokens, so it must be cleared.
+    void reset(const llama_config_t& cfg) {
+        std::uint32_t kv_dim = cfg.n_head_kv * cfg.head_dim();
+        std::size_t cache_size = static_cast<std::size_t>(cfg.n_layers)
+                               * cfg.n_ctx
+                               * kv_dim;
+        std::memset(key_cache,   0, sizeof(float) * cache_size);
+        std::memset(value_cache, 0, sizeof(float) * cache_size);
+        pos = 0;
+    }
+
     // Free all buffers
     void free_buffers() {
         delete[] x;           x = nullptr;

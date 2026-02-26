@@ -21,6 +21,18 @@ enum class Backend { NAIVE, NEON };
 void set_backend(Backend b);
 Backend get_backend();
 
+// -------------------- Thread Count --------------------
+// Set the number of threads for parallel matmul.
+// Default is 1 (single-threaded). Set to the number of CPU cores
+// for maximum throughput: --threads 8 on M2.
+//
+// Each matmul call splits rows across threads. Every thread
+// independently runs the NEON (or naive) code on its chunk of rows.
+// No conflicts because each row's output is independent.
+
+void set_num_threads(int n);
+int get_num_threads();
+
 // Helper 
 //
 

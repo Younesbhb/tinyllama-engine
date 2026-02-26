@@ -771,6 +771,75 @@ void test_matmul_q4_0() {
 }
 
 
+void test_multithreaded_matmul() {
+    std::cout << "\n=== multithreaded matmul ===\n";
+
+    // Test: Run a larger Q8_0 matmul with 1 thread and 4 threads,
+    // verify both produce the same results.
+    // 8 rows × 64 columns = 2 blocks per row, 8 rows
+    const int rows = 8;
+    const int cols = 64;
+    const int blocks_per_row = cols / QK8_0;
+
+    // Create weight blocks: each int8 = 1, scale = 0.5
+    std::vector<block_q8_0> blocks(rows * blocks_per_row);
+    for (auto& b : blocks) {
+        b.d = 0x3800; // 0.5 in F16
+        for (int j = 0; j < QK8_0; j++) b.qs[j] = 1;
+    }
+
+    // Input: all 1.0
+    std::vector<float> x(cols, 1.0f);
+
+    // Expected per row: 0.5 * (1*1 × 32) + 0.5 * (1*1 × 32) = 16 + 16 = 32.0
+
+    // Run single-threaded
+    std::vector<float> out_1t(rows, 0.0f);
+    set_num_threads(1);
+    matmul_q8_0(out_1t.data(), blocks.data(), x.data(), rows, cols);
+
+    // Run multi-threaded
+    std::vector<float> out_4t(rows, 0.0f);
+    set_num_threads(4);
+    matmul_q8_0(out_4t.data(), blocks.data(), x.data(), rows, cols);
+
+    // Compare
+    bool match = true;
+    for (int i = 0; i < rows; i++) {
+        if (!approx_equal(out_1t[i], out_4t[i])) {
+            match = false;
+            std::cout << "    MISMATCH row " << i << ": 1t=" << out_1t[i]
+                      << " 4t=" << out_4t[i] << "\n";
+        }
+    }
+    check("Q8_0: 1-thread vs 4-thread results match", match);
+    check("Q8_0: row 0 = 32.0", approx_equal(out_4t[0], 32.0f, 0.5f));
+    check("Q8_0: row 7 = 32.0", approx_equal(out_4t[7], 32.0f, 0.5f));
+
+    // Also test F32 with threads
+    std::vector<float> W_f32(rows * cols, 2.0f); // all weights = 2.0
+    std::vector<float> out_f32_1t(rows, 0.0f);
+    std::vector<float> out_f32_4t(rows, 0.0f);
+
+    set_num_threads(1);
+    matmul_f32(out_f32_1t.data(), W_f32.data(), x.data(), rows, cols);
+
+    set_num_threads(4);
+    matmul_f32(out_f32_4t.data(), W_f32.data(), x.data(), rows, cols);
+
+    bool f32_match = true;
+    for (int i = 0; i < rows; i++) {
+        if (!approx_equal(out_f32_1t[i], out_f32_4t[i])) f32_match = false;
+    }
+    check("F32: 1-thread vs 4-thread results match", f32_match);
+    // Each row: 2.0 * 1.0 × 64 cols = 128.0
+    check("F32: row 0 = 128.0", approx_equal(out_f32_4t[0], 128.0f, 0.5f));
+
+    // Reset to single-threaded for remaining tests
+    set_num_threads(1);
+}
+
+
 // -------------------- main --------------------
 
 int main() {
@@ -791,6 +860,7 @@ int main() {
     test_rope();
     test_matmul_realistic_size();
     test_sampling();
+    test_multithreaded_matmul();
 
     std::cout << "\n============================\n";
     std::cout << "Results: " << tests_passed << " passed, "

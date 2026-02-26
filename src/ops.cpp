@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <random>
 #include <numeric>
+#include <thread>
+#include <vector>
 
 // Phase 8: ARM NEON SIMD optimization
 // On ARM (your M2 Mac), this header gives us access to NEON intrinsics —
@@ -33,6 +35,79 @@ static Backend g_backend =
 
 void set_backend(Backend b) { g_backend = b; }
 Backend get_backend() { return g_backend; }
+
+
+// -------------------- Thread Count --------------------
+// Number of threads for parallel matmul. Default 1 (no threading).
+// Changed via set_num_threads() or --threads CLI flag.
+
+static int g_num_threads = 1;
+
+void set_num_threads(int n) { g_num_threads = (n < 1) ? 1 : n; }
+int get_num_threads() { return g_num_threads; }
+
+
+// -------------------- Parallel For --------------------
+//
+// Splits a range [0, total) across g_num_threads threads.
+// Each thread calls func(start, end) on its chunk.
+//
+// If g_num_threads == 1, no threads are created — just calls func directly.
+// This avoids any overhead for the single-threaded case.
+//
+// Why not std::async or OpenMP?
+//   - std::async has unpredictable scheduling overhead
+//   - OpenMP requires compiler flags (-fopenmp) and isn't always available
+//   - std::thread gives us full control with minimal complexity
+//
+// Thread creation overhead is ~10μs per thread on M2. With ~154 matmul
+// calls per token and 7 threads each, that's ~10ms overhead per token.
+// Since each token takes ~350ms (Q8_0 NEON), the overhead is ~3%.
+
+template<typename Func>
+static void parallel_for(int total, Func&& func) {
+    int n_threads = g_num_threads;
+
+    // Single-threaded: skip all thread machinery
+    if (n_threads <= 1 || total <= 1) {
+        func(0, total);
+        return;
+    }
+
+    // Don't create more threads than there are rows
+    if (n_threads > total) n_threads = total;
+
+    // Divide rows into chunks. Last thread gets any remainder.
+    // Example with 2048 rows, 8 threads:
+    //   chunk = 2048 / 8 = 256
+    //   Thread 0: rows 0-255
+    //   Thread 1: rows 256-511
+    //   ...
+    //   Thread 7: rows 1792-2047
+    int chunk = total / n_threads;
+
+    std::vector<std::thread> threads;
+    threads.reserve(n_threads - 1);
+
+    // Launch n_threads - 1 worker threads
+    for (int t = 0; t < n_threads - 1; t++) {
+        int start = t * chunk;
+        int end = start + chunk;
+        // emplace_back(func, start, end) creates a new thread and immediately starts it running func(start, end)
+        threads.emplace_back(func, start, end);
+    }
+
+    // Current thread handles the last chunk (includes any remainder)
+    int last_start = (n_threads - 1) * chunk;
+    func(last_start, total);
+
+    // Wait for all worker threads to finish
+    for (auto& th : threads) {
+        // `join()` means "wait until this thread finishes." We loop through all 7 worker threads and wait for each one.
+        // The current thread already finished its own chunk (the `func` call above completed), so now it just waits for any stragglers.
+        th.join();
+    }
+}
 
 
 // -------------------- FP16 → F32 conversion --------------------
@@ -104,7 +179,9 @@ void matmul_f32(float* out, const float* W, const float* x,
                 int rows, int cols) {
 #ifdef __ARM_NEON
     if (g_backend == Backend::NEON) {
-        for (int i = 0; i < rows; i++) {
+        // Lambdas can capture variables (the [&] part captures out, W, x, cols, blocks_per_row)
+        parallel_for(rows, [&](int start, int end) {
+        for (int i = start; i < end; i++) {
             const float* row = W + i * cols;
 
             // 4 independent accumulator registers — each holds 4 partial sums.
@@ -167,11 +244,13 @@ void matmul_f32(float* out, const float* W, const float* x,
 
             out[i] = sum;
         }
+        });
         return;
     }
 #endif
     // Naive path
-    for (int i = 0; i < rows; i++) {
+    parallel_for(rows, [&](int start, int end) {
+    for (int i = start; i < end; i++) {
         float sum = 0.0f;
         // Pointer to the start of row i in the weight matrix
         const float* row = W + i * cols;
@@ -180,6 +259,7 @@ void matmul_f32(float* out, const float* W, const float* x,
         }
         out[i] = sum;
     }
+    });
 }
 
 
@@ -201,7 +281,8 @@ void matmul_f16(float* out, const std::uint16_t* W, const float* x,
                 int rows, int cols) {
 #ifdef __ARM_NEON
     if (g_backend == Backend::NEON) {
-        for (int i = 0; i < rows; i++) {
+        parallel_for(rows, [&](int start, int end) {
+        for (int i = start; i < end; i++) {
             const std::uint16_t* row = W + i * cols;
 
             float32x4_t sum0 = vdupq_n_f32(0.0f);
@@ -254,11 +335,13 @@ void matmul_f16(float* out, const std::uint16_t* W, const float* x,
 
             out[i] = sum;
         }
+        });
         return;
     }
 #endif
     // Naive path
-    for (int i = 0; i < rows; i++) {
+    parallel_for(rows, [&](int start, int end) {
+    for (int i = start; i < end; i++) {
         float sum = 0.0f;
         // Pointer to the start of row i (each element is 2 bytes)
         const std::uint16_t* row = W + i * cols;
@@ -268,6 +351,7 @@ void matmul_f16(float* out, const std::uint16_t* W, const float* x,
         }
         out[i] = sum;
     }
+    });
 }
 
 
@@ -297,7 +381,8 @@ void matmul_q8_0(float* out, const block_q8_0* W, const float* x,
 
 #ifdef __ARM_NEON
     if (g_backend == Backend::NEON) {
-        for (int i = 0; i < rows; i++) {
+        parallel_for(rows, [&](int start, int end) {
+        for (int i = start; i < end; i++) {
             const block_q8_0* row_blocks = W + i * blocks_per_row;
             float sum = 0.0f;
 
@@ -350,13 +435,15 @@ void matmul_q8_0(float* out, const block_q8_0* W, const float* x,
 
             out[i] = sum;
         }
+        });
         return;
     }
 #endif
     // Naive path
-    
+
+    parallel_for(rows, [&](int start, int end) {
     // For each row loop
-    for (int i = 0; i < rows; i++) {
+    for (int i = start; i < end; i++) {
         const block_q8_0* row_blocks = W + i * blocks_per_row;
         float sum = 0.0f;
 
@@ -381,6 +468,7 @@ void matmul_q8_0(float* out, const block_q8_0* W, const float* x,
 
         out[i] = sum;
     }
+    });
 }
 
 
@@ -409,7 +497,8 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
 
 #ifdef __ARM_NEON
     if (g_backend == Backend::NEON) {
-        for (int i = 0; i < rows; i++) {
+        parallel_for(rows, [&](int start, int end) {
+        for (int i = start; i < end; i++) {
             const block_q4_0* row_blocks = W + i * blocks_per_row;
             float sum = 0.0f;
 
@@ -424,7 +513,7 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
                 // Load all 16 packed bytes at once
                 // vld1q_u8(ptr): Load 16 uint8 values from memory into a 128-bit register
                 uint8x16_t raw = vld1q_u8(qs);
-                
+
                 // There are 32 nibbles total. Each byte has 2 nibbles, and we have 16 bytes:
                 // 16 bytes × 2 nibbles per byte = 32 nibbles = 32 weights.
                 // 1 nibble - > 0000
@@ -472,7 +561,7 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
                 // vmovl_s16(a): Widen 4 int16 → 4 int32. 64-bit → 128-bit
                 // vcvtq_f32_s32(a): Convert 4 int32 → 4 float32. Integer to floating point
                 float32x4_t f0 = vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16_a)));
-                // // Multiply with input floats and accumulate
+                // Multiply with input floats and accumulate
                 acc0 = vfmaq_f32(acc0, f0, vld1q_f32(xb));
 
                 // Elements 4-7
@@ -520,11 +609,13 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
 
             out[i] = sum;
         }
+        });
         return;
     }
 #endif
     // Naive path
-    for (int i = 0; i < rows; i++) {
+    parallel_for(rows, [&](int start, int end) {
+    for (int i = start; i < end; i++) {
         const block_q4_0* row_blocks = W + i * blocks_per_row;
         float sum = 0.0f;
 
@@ -559,6 +650,7 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
 
         out[i] = sum;
     }
+    });
 }
 
 

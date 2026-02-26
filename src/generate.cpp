@@ -11,12 +11,11 @@
 
 
 
-
 // -------------------- Generation Loop --------------------
 //
 // This is where the engine comes alive. The loop:
 //   1. Encode the prompt into token IDs
-//   2. Prepend BOS token
+//   2. Prepend BOS token (first turn only)
 //   3. Run forward pass for each prompt token (fills KV cache)
 //   4. Sample next token from the logits
 //   5. Feed that token back in, run forward again
@@ -28,8 +27,13 @@
 //
 // Generation (steps 4-6) is called "decode" — one new token per
 // forward pass.
+//
+// Multi-turn support:
+//   - state.pos persists across calls (never reset here)
+//   - BOS is only prepended on the first turn (pos == 0)
+//   - KV cache accumulates the entire conversation history
+//   - Context window is shared across all turns
 
-// max_tokens is set 30 for testing, 1 token takes 30 seconds to generate.
 void generate(GGUFModel& model, RunState& state,
                      const std::string& prompt,
                      int max_tokens,
@@ -39,24 +43,30 @@ void generate(GGUFModel& model, RunState& state,
     const auto& cfg = model.config();
     const auto& tok = model.tokenizer();
     int n_vocab = static_cast<int>(cfg.n_vocab);
+    int n_ctx   = static_cast<int>(cfg.n_ctx);
 
     // ---- Step 1: Encode the prompt ----
     std::vector<uint32_t> prompt_tokens = tok.encode(prompt);
 
-    // Prepend BOS token (the model expects this at the start)
-    prompt_tokens.insert(prompt_tokens.begin(), tok.bos_token());
-
-    std::cout << "Prompt tokens: " << prompt_tokens.size() << " [";
-    for (size_t i = 0; i < prompt_tokens.size(); i++) {
-        std::cout << prompt_tokens[i];
-        if (i + 1 < prompt_tokens.size()) std::cout << ", ";
+    // Prepend BOS only on the very first turn of a conversation.
+    // Subsequent turns continue from where the KV cache left off.
+    if (state.pos == 0) {
+        prompt_tokens.insert(prompt_tokens.begin(), tok.bos_token());
     }
-    std::cout << "]\n\n";
+
+    // Check if prompt alone would overflow the context window
+    int tokens_needed = static_cast<int>(prompt_tokens.size());
+    int remaining = n_ctx - state.pos;
+    if (tokens_needed >= remaining) {
+        std::cout << "\n[context window full — cannot fit prompt ("
+                  << tokens_needed << " tokens, "
+                  << remaining << " remaining)]\n";
+        return;
+    }
 
     // ---- Step 2: Prefill — process prompt tokens ----
     // Run forward pass for each prompt token to fill KV cache.
     // We only care about the logits after the LAST prompt token.
-    state.pos = 0;
     int next_token = 0;
 
     // Let the model read the prompt
@@ -81,6 +91,12 @@ void generate(GGUFModel& model, RunState& state,
 
     // ---- Step 3: Generate — one token at a time ----
     for (int i = 1; i < max_tokens; i++) {
+        // Check context window limit BEFORE the forward pass
+        if (state.pos >= n_ctx) {
+            std::cout << "\n[context window full]\n";
+            break;
+        }
+
         forward(model, state, next_token, state.pos);
         state.pos++;
 
@@ -93,12 +109,6 @@ void generate(GGUFModel& model, RunState& state,
 
         // Check for end of sequence
         if (static_cast<uint32_t>(next_token) == tok.eos_token()) {
-            break;
-        }
-
-        // Check context window limit
-        if (state.pos >= static_cast<int>(cfg.n_ctx)) {
-            std::cout << "\n[reached max context length]\n";
             break;
         }
 
