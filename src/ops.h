@@ -77,6 +77,9 @@ void matmul_q8_0(float* out, const block_q8_0* W, const float* x,
 void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
                  int rows, int cols);
 
+void matmul_q6_k(float* out, const block_q6_K* W, const float* x,
+                 int rows, int cols);
+
 
 // -------------------- RMSNorm --------------------
 // Llama uses RMSNorm instead of LayerNorm (cheaper: no mean calculation).

@@ -180,6 +180,7 @@ void matmul_f32(float* out, const float* W, const float* x,
 #ifdef __ARM_NEON
     if (g_backend == Backend::NEON) {
         // Lambdas can capture variables (the [&] part captures out, W, x, cols, blocks_per_row)
+        // `parallel_for` takes the total number of rows and splits them across threads. If you have 32,000 rows and 4 threads, thread 1 gets called with `start=0, end=8000`, thread 2 gets `start=8000, end=16000`, etc. Each thread runs the same function on its chunk.
         parallel_for(rows, [&](int start, int end) {
         for (int i = start; i < end; i++) {
             const float* row = W + i * cols;
@@ -654,6 +655,301 @@ void matmul_q4_0(float* out, const block_q4_0* W, const float* x,
 }
 
 
+// -------------------- Matrix-Vector Multiply (Q6_K weights) --------------------
+//
+// Q6_K is a "k-quant" super-block format: 256 elements per block.
+// Used for sensitive tensors like output.weight even in Q4_0 models,
+// because the final vocabulary projection benefits from extra precision
+// (6.5625 bits per weight vs 4.5 for Q4_0).
+//
+// Super-block layout (210 bytes for 256 weights):
+//   ql[128] — lower 4 bits of each 6-bit quantized value
+//   qh[64]  — upper 2 bits of each 6-bit quantized value
+//   scales[16] — int8 scale factor for each sub-block of 16 elements
+//   d (F16)    — super-block scale shared across all 256 weights
+//
+// The bit layout is interleaved (not sequential) for SIMD efficiency.
+// The 256 elements are split into two halves (0-127 and 128-255),
+// and within each half, ql bytes store low/high nibbles for different
+// output positions. This matches the llama.cpp reference implementation.
+//
+// Dequantization for element at output position p:
+//   1. Extract lower 4 bits from ql (which byte and which nibble depends on p)
+//   2. Extract upper 2 bits from qh (which byte and which bit pair depends on p)
+//   3. Combine: q6_value = (low4 | (high2 << 4)) - 32   (signed range -32 to +31)
+//   4. float_weight = fp16_to_f32(d) * scales[p / 16] * q6_value
+//
+// For matmul we fuse this with the dot product — we never store the
+// dequantized floats, just accumulate scale * sub_block_scale * (q6 · x).
+
+void matmul_q6_k(float* out, const block_q6_K* W, const float* x,
+                 int rows, int cols) {
+    int blocks_per_row = cols / QK_K;
+
+#ifdef __ARM_NEON
+    if (g_backend == Backend::NEON) {
+        parallel_for(rows, [&](int start, int end) {
+        // for each row
+        for (int i = start; i < end; i++) {
+            const block_q6_K* row_blocks = W + i * blocks_per_row;
+            float sum = 0.0f;
+
+            // for each block in a certain row
+            for (int b = 0; b < blocks_per_row; b++) {
+                float d = fp16_to_f32(row_blocks[b].d);
+                const std::uint8_t* ql = row_blocks[b].ql;
+                const std::uint8_t* qh = row_blocks[b].qh;
+                const std::int8_t*  sc = row_blocks[b].scales;
+                const float* xb = x + b * QK_K;
+
+                // Process first half (elements 0-127)
+                // The inner loop runs l = 0..31, producing 4 outputs each iteration
+                // at positions l+0, l+32, l+64, l+96 — all using ql[0..63] and qh[0..31]
+                // We process 32 weights per iteration
+                for (int l = 0; l < 32; l += 8) {
+                    int is = l / 16;  // sub-block index: 0 for l=0..15, 1 for l=16..31
+
+                    // Load 8 bytes from each ql region and qh
+                    // vld1_u8(ql + l)  loads ql[0], ql[1], ql[2], ql[3], ql[4], ql[5], ql[6], ql[7]
+                    uint8x8_t ql0 = vld1_u8(ql + l);       // ql[l+0..l+7]
+                    // vld1_u8(ql + l + 32)  loads ql[32],ql[33],ql[34],ql[35],ql[36],ql[37],ql[38],ql[39]
+                    uint8x8_t ql1 = vld1_u8(ql + l + 32);  // ql[l+32..l+39]
+                    // vld1_u8(qh + l)  loads qh[0], qh[1], qh[2], qh[3], qh[4], qh[5], qh[6], qh[7]
+                    uint8x8_t qhv = vld1_u8(qh + l);       // qh[l+0..l+7]
+
+                    // Simple reminder of how the bits are extracted in the naive path
+                    // Extract the four 6-bit values per element:
+                    // q1 = (ql[l] & 0xF) | ((qh[l] >> 0) & 3) << 4  → element l+0
+                    // q2 = (ql[l+32] & 0xF) | ((qh[l] >> 2) & 3) << 4  → element l+32
+                    // q3 = (ql[l] >> 4) | ((qh[l] >> 4) & 3) << 4  → element l+64
+                    // q4 = (ql[l+32] >> 4) | ((qh[l] >> 6) & 3) << 4  → element l+96
+
+                    // --- q1: elements l+0 ---
+                    // vdup_n_u8(0x0F) fills a register with 8 copies of 0x0F.
+                    // Then vand ANDs each byte. This is ql[l] & 0x0F done 8 times at once.
+                    uint8x8_t low4_0 = vand_u8(ql0, vdup_n_u8(0x0F));
+                    uint8x8_t hi2_0  = vand_u8(qhv, vdup_n_u8(0x03));
+                    // vshl_n_u8(hi2_0, 4) shifts each byte left by 4, putting those 2 bits into positions 4-5. Then vorr ORs them together. This is low4 | (hi2 << 4) done 8 times.
+                    uint8x8_t q1_u8  = vorr_u8(low4_0, vshl_n_u8(hi2_0, 4));
+                    // Widen to int16 and subtract 32 to get signed range
+                    // vmovl_u8(q1_u8) — widen from 8-bit to 16-bit
+                    // vreinterpretq_s16_u16 then tells the compiler "treat these as signed int16 now." No bits change, just the type label.
+                    int16x8_t q1_s16 = vreinterpretq_s16_u16(vmovl_u8(q1_u8));
+                    // vsubq_s16(q1_s16, vdupq_n_s16(32)) — subtract 32
+                    // q1_s16 now contains 8 weights
+                    q1_s16 = vsubq_s16(q1_s16, vdupq_n_s16(32));
+
+
+                    // float sc1 = static_cast<float>(sc[is + 0]) — load the sub-block scale, just a regular scalar read.
+                    // We cast to float because we can't multiply an int8 with a float directly in this context, and we need it as a float to precompute d * sc1
+                    float sc1 = static_cast<float>(sc[is + 0]);
+                    // vget_low_s16(q1_s16) and vget_high_s16(q1_s16) — split 8 values into two groups of 4
+                    // vmovl_s16(...) — widen int16 → int32
+                    // vcvtq_f32_s32(...) — convert int32 → float32
+                    float32x4_t f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_s16)));
+                    float32x4_t f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_s16)));
+                    // vdupq_n_f32(d * sc1) — multiply master scale by sub-block scale, then fill a register with 4 copies of that
+                    // ds1 = [d*sc1, d*sc1, d*sc1, d*sc1]
+                    float32x4_t ds1 = vdupq_n_f32(d * sc1);
+                    // vld1q_f32(xb + l) — load 4 input values: [xb[0], xb[1], xb[2], xb[3]]
+                    // vmulq_f32(f_lo, ...) — multiply weights by inputs: [7.0*xb[0], 11.0*xb[1], -14.0*xb[2], 3.0*xb[3]]
+                    // vmulq_f32(ds1, ...) — multiply by the combined scale: [d*sc1*7.0*xb[0], d*sc1*11.0*xb[1], ...]
+                    float32x4_t acc0 = vmulq_f32(ds1, vmulq_f32(f_lo, vld1q_f32(xb + l)));
+                    float32x4_t acc1 = vmulq_f32(ds1, vmulq_f32(f_hi, vld1q_f32(xb + l + 4)));
+
+                    // --- q2: elements l+32 ---
+                    uint8x8_t low4_1 = vand_u8(ql1, vdup_n_u8(0x0F));
+                    // vshr_n_u8(qhv, 2) shifts every byte in the register right by 2 bits. This is the NEON version of qh[l] >> 2
+                    uint8x8_t hi2_1  = vand_u8(vshr_n_u8(qhv, 2), vdup_n_u8(0x03));
+                    uint8x8_t q2_u8  = vorr_u8(low4_1, vshl_n_u8(hi2_1, 4));
+                    int16x8_t q2_s16 = vreinterpretq_s16_u16(vmovl_u8(q2_u8));
+                    // q2_s16 now contains 8 weights
+                    q2_s16 = vsubq_s16(q2_s16, vdupq_n_s16(32));
+
+                    float sc2 = static_cast<float>(sc[is + 2]);
+                    float32x4_t ds2 = vdupq_n_f32(d * sc2);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_s16)));
+                    acc0 = vfmaq_f32(acc0, ds2, vmulq_f32(f_lo, vld1q_f32(xb + l + 32)));
+                    acc1 = vfmaq_f32(acc1, ds2, vmulq_f32(f_hi, vld1q_f32(xb + l + 36)));
+
+                    // --- q3: elements l+64 ---
+                    uint8x8_t hi4_0  = vshr_n_u8(ql0, 4);
+                    uint8x8_t hi2_2  = vand_u8(vshr_n_u8(qhv, 4), vdup_n_u8(0x03));
+                    uint8x8_t q3_u8  = vorr_u8(hi4_0, vshl_n_u8(hi2_2, 4));
+                    int16x8_t q3_s16 = vreinterpretq_s16_u16(vmovl_u8(q3_u8));
+                    q3_s16 = vsubq_s16(q3_s16, vdupq_n_s16(32));
+
+                    float sc3 = static_cast<float>(sc[is + 4]);
+                    float32x4_t ds3 = vdupq_n_f32(d * sc3);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q3_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q3_s16)));
+                    acc0 = vfmaq_f32(acc0, ds3, vmulq_f32(f_lo, vld1q_f32(xb + l + 64)));
+                    acc1 = vfmaq_f32(acc1, ds3, vmulq_f32(f_hi, vld1q_f32(xb + l + 68)));
+
+                    // --- q4: elements l+96 ---
+                    uint8x8_t hi4_1  = vshr_n_u8(ql1, 4);
+                    uint8x8_t hi2_3  = vshr_n_u8(qhv, 6);  // top 2 bits, no mask needed
+                    uint8x8_t q4_u8  = vorr_u8(hi4_1, vshl_n_u8(hi2_3, 4));
+                    int16x8_t q4_s16 = vreinterpretq_s16_u16(vmovl_u8(q4_u8));
+                    q4_s16 = vsubq_s16(q4_s16, vdupq_n_s16(32));
+
+                    float sc4 = static_cast<float>(sc[is + 6]);
+                    float32x4_t ds4 = vdupq_n_f32(d * sc4);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q4_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q4_s16)));
+                    acc0 = vfmaq_f32(acc0, ds4, vmulq_f32(f_lo, vld1q_f32(xb + l + 96)));
+                    acc1 = vfmaq_f32(acc1, ds4, vmulq_f32(f_hi, vld1q_f32(xb + l + 100)));
+
+                    sum += vaddvq_f32(vaddq_f32(acc0, acc1));
+                }
+
+                // Process second half (elements 128-255)
+                // Same pattern but using ql[64..127] and qh[32..63], scales[8..15]
+                for (int l = 0; l < 32; l += 8) {
+                    int is = l / 16;
+
+                    uint8x8_t ql0 = vld1_u8(ql + l + 64);
+                    uint8x8_t ql1 = vld1_u8(ql + l + 96);
+                    uint8x8_t qhv = vld1_u8(qh + l + 32);
+
+                    // --- q1: elements l+128 ---
+                    uint8x8_t low4_0 = vand_u8(ql0, vdup_n_u8(0x0F));
+                    uint8x8_t hi2_0  = vand_u8(qhv, vdup_n_u8(0x03));
+                    uint8x8_t q1_u8  = vorr_u8(low4_0, vshl_n_u8(hi2_0, 4));
+                    int16x8_t q1_s16 = vreinterpretq_s16_u16(vmovl_u8(q1_u8));
+                    q1_s16 = vsubq_s16(q1_s16, vdupq_n_s16(32));
+
+                    float sc1 = static_cast<float>(sc[is + 8]);
+                    float32x4_t ds1 = vdupq_n_f32(d * sc1);
+                    float32x4_t f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_s16)));
+                    float32x4_t f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_s16)));
+                    float32x4_t acc0 = vmulq_f32(ds1, vmulq_f32(f_lo, vld1q_f32(xb + l + 128)));
+                    float32x4_t acc1 = vmulq_f32(ds1, vmulq_f32(f_hi, vld1q_f32(xb + l + 132)));
+
+                    // --- q2: elements l+160 ---
+                    uint8x8_t low4_1 = vand_u8(ql1, vdup_n_u8(0x0F));
+                    uint8x8_t hi2_1  = vand_u8(vshr_n_u8(qhv, 2), vdup_n_u8(0x03));
+                    uint8x8_t q2_u8  = vorr_u8(low4_1, vshl_n_u8(hi2_1, 4));
+                    int16x8_t q2_s16 = vreinterpretq_s16_u16(vmovl_u8(q2_u8));
+                    q2_s16 = vsubq_s16(q2_s16, vdupq_n_s16(32));
+
+                    float sc2 = static_cast<float>(sc[is + 10]);
+                    float32x4_t ds2 = vdupq_n_f32(d * sc2);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_s16)));
+                    acc0 = vfmaq_f32(acc0, ds2, vmulq_f32(f_lo, vld1q_f32(xb + l + 160)));
+                    acc1 = vfmaq_f32(acc1, ds2, vmulq_f32(f_hi, vld1q_f32(xb + l + 164)));
+
+                    // --- q3: elements l+192 ---
+                    uint8x8_t hi4_0  = vshr_n_u8(ql0, 4);
+                    uint8x8_t hi2_2  = vand_u8(vshr_n_u8(qhv, 4), vdup_n_u8(0x03));
+                    uint8x8_t q3_u8  = vorr_u8(hi4_0, vshl_n_u8(hi2_2, 4));
+                    int16x8_t q3_s16 = vreinterpretq_s16_u16(vmovl_u8(q3_u8));
+                    q3_s16 = vsubq_s16(q3_s16, vdupq_n_s16(32));
+
+                    float sc3 = static_cast<float>(sc[is + 12]);
+                    float32x4_t ds3 = vdupq_n_f32(d * sc3);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q3_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q3_s16)));
+                    acc0 = vfmaq_f32(acc0, ds3, vmulq_f32(f_lo, vld1q_f32(xb + l + 192)));
+                    acc1 = vfmaq_f32(acc1, ds3, vmulq_f32(f_hi, vld1q_f32(xb + l + 196)));
+
+                    // --- q4: elements l+224 ---
+                    uint8x8_t hi4_1  = vshr_n_u8(ql1, 4);
+                    uint8x8_t hi2_3  = vshr_n_u8(qhv, 6);
+                    uint8x8_t q4_u8  = vorr_u8(hi4_1, vshl_n_u8(hi2_3, 4));
+                    int16x8_t q4_s16 = vreinterpretq_s16_u16(vmovl_u8(q4_u8));
+                    q4_s16 = vsubq_s16(q4_s16, vdupq_n_s16(32));
+
+                    float sc4 = static_cast<float>(sc[is + 14]);
+                    float32x4_t ds4 = vdupq_n_f32(d * sc4);
+                    f_lo = vcvtq_f32_s32(vmovl_s16(vget_low_s16(q4_s16)));
+                    f_hi = vcvtq_f32_s32(vmovl_s16(vget_high_s16(q4_s16)));
+                    acc0 = vfmaq_f32(acc0, ds4, vmulq_f32(f_lo, vld1q_f32(xb + l + 224)));
+                    acc1 = vfmaq_f32(acc1, ds4, vmulq_f32(f_hi, vld1q_f32(xb + l + 228)));
+
+                    sum += vaddvq_f32(vaddq_f32(acc0, acc1));
+                }
+            }
+            out[i] = sum;
+        }
+        });
+        return;
+    }
+#endif
+
+    // ---- Naive (scalar) path ----
+    //
+    // This follows the llama.cpp reference dequantization exactly.
+    // The 256 elements are processed in two halves (0-127 and 128-255).
+    // Within each half, the inner loop (l = 0..31) produces 4 output
+    // elements per iteration at strides of 32 (l+0, l+32, l+64, l+96).
+    //
+    // The bit extraction pattern:
+    //   q1 uses ql low nibble + qh bits 0-1  → output at l+0   (or l+128)
+    //   q2 uses ql+32 low nibble + qh bits 2-3  → output at l+32  (or l+160)
+    //   q3 uses ql high nibble + qh bits 4-5  → output at l+64  (or l+192)
+    //   q4 uses ql+32 high nibble + qh bits 6-7  → output at l+96  (or l+224)
+
+    parallel_for(rows, [&](int start, int end) {
+    for (int i = start; i < end; i++) {
+        const block_q6_K* row_blocks = W + i * blocks_per_row;
+        float sum = 0.0f;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            float d = fp16_to_f32(row_blocks[b].d);
+            const std::uint8_t* ql = row_blocks[b].ql;
+            const std::uint8_t* qh = row_blocks[b].qh;
+            const std::int8_t*  sc = row_blocks[b].scales;
+            const float* xb = x + b * QK_K;
+
+            // First half: elements 0-127
+            // The first half covers 128 weights (positions 0-127). Each iteration decodes 4 weights. So you need 128 ÷ 4 = 32 iterations.
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;  // which sub-block pair (0 or 1)
+                // 4 bits are stored in ql and 2 bits are stored in qh to form each weight (6 bits per weight)
+                // qh only contains 32 bytes
+                /*
+                Now the question is: which 4 weights share one qh byte? The format designers spaced them evenly: qh[0] serves weights 0, 32, 64, 96. qh[1] serves weights 1, 33, 65, 97. qh[l] serves weights l, l+32, l+64, l+96. The stride is 32 because 128 weights ÷ 4 per byte = 32.
+                And ql follows the same pattern to stay aligned. The first 32 bytes of ql (indices 0-31) hold the low nibbles for positions 0-31 and high nibbles for positions 64-95. The next 32 bytes (indices 32-63) hold low nibbles for positions 32-63 and high nibbles for positions 96-127.
+                */
+
+                int q1 = (static_cast<int>(ql[l]      & 0x0F) | (static_cast<int>((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (static_cast<int>(ql[l + 32]  & 0x0F) | (static_cast<int>((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (static_cast<int>(ql[l]      >> 4)    | (static_cast<int>((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (static_cast<int>(ql[l + 32]  >> 4)    | (static_cast<int>((qh[l] >> 6) & 3) << 4)) - 32;
+
+                // Stride of 2 for sc[is + 2k] because 32 positions apart ÷ 16 per scale = 2
+                sum += d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1) * xb[l +  0];
+                sum += d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2) * xb[l + 32];
+                sum += d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3) * xb[l + 64];
+                sum += d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4) * xb[l + 96];
+            }
+
+            // Second half: elements 128-255
+            // Same pattern, but ql offset by 64, qh offset by 32, scales offset by 8
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+
+                int q1 = (static_cast<int>(ql[l + 64]  & 0x0F) | (static_cast<int>((qh[l + 32] >> 0) & 3) << 4)) - 32;
+                int q2 = (static_cast<int>(ql[l + 96]  & 0x0F) | (static_cast<int>((qh[l + 32] >> 2) & 3) << 4)) - 32;
+                int q3 = (static_cast<int>(ql[l + 64]  >> 4)    | (static_cast<int>((qh[l + 32] >> 4) & 3) << 4)) - 32;
+                int q4 = (static_cast<int>(ql[l + 96]  >> 4)    | (static_cast<int>((qh[l + 32] >> 6) & 3) << 4)) - 32;
+
+                sum += d * static_cast<float>(sc[is +  8]) * static_cast<float>(q1) * xb[l + 128];
+                sum += d * static_cast<float>(sc[is + 10]) * static_cast<float>(q2) * xb[l + 160];
+                sum += d * static_cast<float>(sc[is + 12]) * static_cast<float>(q3) * xb[l + 192];
+                sum += d * static_cast<float>(sc[is + 14]) * static_cast<float>(q4) * xb[l + 224];
+            }
+        }
+
+        out[i] = sum;
+    }
+    });
+}
+
+
 // -------------------- Matrix-Vector Multiply (type dispatch) --------------------
 //
 // This is the function called in the forward pass.
@@ -674,6 +970,9 @@ void matmul(float* out, const void* W, const float* x,
             break;
         case GGML_TYPE_Q4_0:
             matmul_q4_0(out, static_cast<const block_q4_0*>(W), x, rows, cols);
+            break;
+        case GGML_TYPE_Q6_K:
+            matmul_q6_k(out, static_cast<const block_q6_K*>(W), x, rows, cols);
             break;
         default:
             throw std::runtime_error(

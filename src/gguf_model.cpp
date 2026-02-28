@@ -47,6 +47,7 @@ static const char* ggml_type_name(ggml_type t) {
         case GGML_TYPE_F16:  return "F16";
         case GGML_TYPE_Q8_0: return "Q8_0";
         case GGML_TYPE_Q4_0: return "Q4_0";
+        case GGML_TYPE_Q6_K: return "Q6_K";
         default: return "OTHER";
     }
 }
@@ -70,6 +71,12 @@ static std::uint64_t tensor_byte_size(std::uint64_t n_elems, ggml_type t) {
             if (n_elems % QK4_0 != 0)
                 throw std::runtime_error("Q4_0 tensor size not a multiple of 32");
             return (n_elems / QK4_0) * sizeof(block_q4_0);
+        }
+        case GGML_TYPE_Q6_K: {
+            // 210 bytes per super-block of 256 elements
+            if (n_elems % QK_K != 0)
+                throw std::runtime_error("Q6_K tensor size not a multiple of 256");
+            return (n_elems / QK_K) * sizeof(block_q6_K);
         }
         default:
             throw std::runtime_error("Unsupported ggml_type for byte size calculation.");

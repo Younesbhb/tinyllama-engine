@@ -29,7 +29,6 @@
 // Generation (steps 4-6) is called "decode" — one new token per
 // forward pass.
 
-// max_tokens is set 30 for testing, 1 token takes 30 seconds to generate.
 void generate(GGUFModel& model, RunState& state,
                      const std::string& prompt,
                      int max_tokens,

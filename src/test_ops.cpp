@@ -771,6 +771,88 @@ void test_matmul_q4_0() {
 }
 
 
+void test_matmul_q6_k() {
+    std::cout << "\n=== matmul_q6_k ===\n";
+
+    // Test 1: All q values = -32 (ql=0, qh=0), scales=1, d=1.0, x=1.0
+    // Each of the 256 elements dequantizes to: 1.0 * 1 * (-32) = -32
+    // Dot product with x=1.0: 256 * (-32) = -8192.0
+    {
+        block_q6_K block;
+        block.d = 0x3C00; // 1.0 in F16
+        std::memset(block.ql, 0x00, sizeof(block.ql));
+        std::memset(block.qh, 0x00, sizeof(block.qh));
+        for (int i = 0; i < 16; i++) block.scales[i] = 1;
+
+        float x[256];
+        for (int i = 0; i < 256; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul_q6_k(&out, &block, x, 1, 256);
+        std::cout << "    Q6_K all q=-32: " << out << " (expected -8192.0)\n";
+        check("Q6_K all ql=0,qh=0 -> q=-32, sum=-8192", approx_equal(out, -8192.0f, 1.0f));
+    }
+
+    // Test 2: All q values = 0 (ql=0, qh=0xAA to set upper 2 bits to 2)
+    // For each qh byte = 0xAA = 10101010:
+    //   (qh >> 0) & 3 = 2,  (qh >> 2) & 3 = 2,  (qh >> 4) & 3 = 2,  (qh >> 6) & 3 = 2
+    // q = (0 | (2 << 4)) - 32 = 32 - 32 = 0
+    {
+        block_q6_K block;
+        block.d = 0x3C00; // 1.0
+        std::memset(block.ql, 0x00, sizeof(block.ql));
+        std::memset(block.qh, 0xAA, sizeof(block.qh));
+        for (int i = 0; i < 16; i++) block.scales[i] = 1;
+
+        float x[256];
+        for (int i = 0; i < 256; i++) x[i] = 1.0f;
+
+        float out = 99.0f;
+        matmul_q6_k(&out, &block, x, 1, 256);
+        std::cout << "    Q6_K all q=0: " << out << " (expected 0.0)\n";
+        check("Q6_K all q=0 -> sum=0", approx_equal(out, 0.0f, 1.0f));
+    }
+
+    // Test 3: Dispatch through matmul()
+    {
+        block_q6_K block;
+        block.d = 0x3C00; // 1.0
+        std::memset(block.ql, 0x00, sizeof(block.ql));
+        std::memset(block.qh, 0x00, sizeof(block.qh));
+        for (int i = 0; i < 16; i++) block.scales[i] = 1;
+
+        float x[256];
+        for (int i = 0; i < 256; i++) x[i] = 1.0f;
+
+        float out = 0.0f;
+        matmul(&out, &block, x, 1, 256, GGML_TYPE_Q6_K);
+        std::cout << "    Q6_K dispatch: " << out << " (expected -8192.0)\n";
+        check("Q6_K dispatch through matmul()", approx_equal(out, -8192.0f, 1.0f));
+    }
+
+    // Test 4: Multi-row with scale = 2.0
+    {
+        block_q6_K blocks[2];
+        for (int r = 0; r < 2; r++) {
+            blocks[r].d = 0x4000; // 2.0 in F16
+            std::memset(blocks[r].ql, 0x00, sizeof(blocks[r].ql));
+            std::memset(blocks[r].qh, 0x00, sizeof(blocks[r].qh));
+            for (int i = 0; i < 16; i++) blocks[r].scales[i] = 1;
+        }
+
+        float x[256];
+        for (int i = 0; i < 256; i++) x[i] = 1.0f;
+
+        float out[2] = {0.0f, 0.0f};
+        matmul_q6_k(out, blocks, x, 2, 256);
+        std::cout << "    Q6_K multi-row: [" << out[0] << ", " << out[1]
+                  << "] (expected [-16384, -16384])\n";
+        check("Q6_K 2-row d=2.0", approx_equal(out[0], -16384.0f, 1.0f)
+                               && approx_equal(out[1], -16384.0f, 1.0f));
+    }
+}
+
+
 void test_multithreaded_matmul() {
     std::cout << "\n=== multithreaded matmul ===\n";
 
@@ -850,6 +932,7 @@ int main() {
     test_matmul_f16();
     test_matmul_q8_0();
     test_matmul_q4_0();
+    test_matmul_q6_k();
     test_rmsnorm();
     test_softmax();
     test_silu();

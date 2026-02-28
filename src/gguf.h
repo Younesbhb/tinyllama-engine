@@ -27,6 +27,8 @@ enum ggml_type : std::uint32_t {
     GGML_TYPE_Q4_1 = 3,   // not implemented, listed for correct numbering
     // gap: 4-6 are other types we don't use
     GGML_TYPE_Q8_0 = 8,
+    // K-quant types (super-block quantization, block size 256)
+    GGML_TYPE_Q6_K = 14,
     GGML_TYPE_COUNT = 40
 };
 
@@ -90,6 +92,47 @@ struct block_q4_0 {
 };
 // Total: 18 bytes for 32 weights
 static_assert(sizeof(block_q4_0) == 18, "Q4_0 block must be 18 bytes");
+
+
+// Q6_K: 6-bit "k-quant" quantization (super-block format)
+// Unlike Q4_0 and Q8_0 which use blocks of 32 elements, Q6_K uses
+// "super-blocks" of 256 elements. This is the format llama.cpp uses
+// for the output.weight tensor even in Q4_0 models, because the final
+// vocabulary projection is sensitive to quantization error and benefits
+// from the extra precision (6.5625 bits per weight vs 4.5).
+//
+// Each super-block stores 256 weights as:
+//   - ql[128]: Lower 4 bits of each 6-bit quantized value (2 per byte)
+//   - qh[64]:  Upper 2 bits of each 6-bit quantized value (4 per byte)
+//   - scales[16]: Per-sub-block int8 scale factors (one per 16 elements)
+//   - d: Super-block scale (F16), shared across all 256 weights
+//
+// To dequantize element i:
+//   1. Extract 6-bit value: q = (lower_4_bits | (upper_2_bits << 4)) - 32
+//   2. float_weight = fp16_to_f32(d) * scales[sub_block] * q
+//
+// The bit layout is interleaved for SIMD efficiency (not sequential),
+// matching the llama.cpp reference implementation in ggml-quants.c.
+
+static constexpr int QK_K = 256;  // super-block size for k-quants
+
+/*
+The division isn't extracting the bits — it's calculating how many bytes we need to store them when we pack multiple values per byte.
+Each of the 256 weights has a 6-bit quantized value. Those 6 bits are split into two pieces: the lower 4 bits and the upper 2 bits, stored in separate arrays.
+ql[QK_K / 2] = ql[128] — lower 4 bits
+Each weight contributes 4 bits. Two sets of 4 bits fit in one byte (one in the low nibble, one in the high nibble). So 256 weights ÷ 2 per byte = 128 bytes.
+qh[QK_K / 4] = qh[64] — upper 2 bits
+Each weight contributes 2 bits. Four sets of 2 bits fit in one byte (bits 0-1, bits 2-3, bits 4-5, bits 6-7). So 256 weights ÷ 4 per byte = 64 bytes.
+*/
+struct block_q6_K {
+    std::uint8_t ql[QK_K / 2];     // lower 4 bits of quants (128 bytes)
+    std::uint8_t qh[QK_K / 4];     // upper 2 bits of quants (64 bytes)
+    std::int8_t  scales[QK_K / 16]; // sub-block scales (16 bytes)
+    std::uint16_t d;                // super-block scale as F16 (2 bytes)
+};
+// Total: 128 + 64 + 16 + 2 = 210 bytes for 256 weights
+// 210 * 8 / 256 = 6.5625 bits per weight
+static_assert(sizeof(block_q6_K) == 210, "Q6_K block must be 210 bytes");
 
 
 // Model configuration extracted from GGUF metadata

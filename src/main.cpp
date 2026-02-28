@@ -139,8 +139,7 @@ int main(int argc, char** argv) {
             prompt = argv[2];
         } else {
             // TinyLlama chat template format
-            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nHow are you?</s>\n<|assistant|>\n";
-
+            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the meaning of life</s>\n<|assistant|>\n";
         }
 
         std::cout << "Prompt: \"" << prompt << "\"\n";
