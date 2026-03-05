@@ -70,7 +70,6 @@ Stats compute_stats(std::vector<double>& values) {
     s.min_val = values.front();
     s.max_val = values.back();
 
-    // Calculate average
     double sum = std::accumulate(values.begin(), values.end(), 0.0);
     s.mean = sum / static_cast<double>(values.size());
 
@@ -173,19 +172,18 @@ void print_results(const BenchConfig& cfg,
                    const std::string& quant_type,
                    int prompt_tokens,
                    Stats& prefill_stats,
-                   Stats& decode_stats,
+                   Stats& decode_tok_stats,
                    int decode_tokens) {
 
-    if (cfg.csv_output) {
-        // CSV header (printed once by the shell script):
-        // label,backend,threads,quant,prompt_toks,decode_toks,
-        // prefill_median_ms,prefill_tok_s,decode_median_ms_tok,decode_tok_s
+    // decode_tok_stats contains ms-per-token values (not total ms)
+    double decode_ms_tok = decode_tok_stats.median;
+    double decode_tok_s  = (decode_ms_tok > 0.0)
+        ? 1000.0 / decode_ms_tok
+        : 0.0;
 
+    if (cfg.csv_output) {
         double prefill_tok_s = static_cast<double>(prompt_tokens) /
                                (prefill_stats.median / 1000.0);
-        double decode_ms_tok = decode_stats.median / static_cast<double>(decode_tokens);
-        double decode_tok_s  = static_cast<double>(decode_tokens) /
-                               (decode_stats.median / 1000.0);
 
         std::cout << cfg.label << ","
                   << backend_name << ","
@@ -232,17 +230,13 @@ void print_results(const BenchConfig& cfg,
               << " — " << std::setprecision(1) << prefill_stats.max_val << "] ms\n";
 
     // Decode results
-    double decode_ms_tok = decode_stats.median / static_cast<double>(decode_tokens);
-    double decode_tok_s  = static_cast<double>(decode_tokens) /
-                           (decode_stats.median / 1000.0);
     std::cout << "║  DECODE\n";
-    std::cout << "║    Median:     " << std::setprecision(1) << decode_stats.median << " ms total"
-              << "  (" << std::setprecision(2) << decode_ms_tok << " ms/tok)\n";
-    std::cout << "║    Throughput: " << std::setprecision(1) << decode_tok_s << " tok/s\n";
-    std::cout << "║    Mean:       " << std::setprecision(1) << decode_stats.mean << " ms"
-              << "  ± " << std::setprecision(1) << decode_stats.stddev << " ms\n";
-    std::cout << "║    Range:      [" << std::setprecision(1) << decode_stats.min_val
-              << " — " << std::setprecision(1) << decode_stats.max_val << "] ms\n";
+    std::cout << "║    Median:     " << std::setprecision(2) << decode_ms_tok << " ms/tok"
+              << "  (" << std::setprecision(1) << decode_tok_s << " tok/s)\n";
+    std::cout << "║    Mean:       " << std::setprecision(2) << decode_tok_stats.mean << " ms/tok"
+              << "  ± " << std::setprecision(2) << decode_tok_stats.stddev << " ms/tok\n";
+    std::cout << "║    Range:      [" << std::setprecision(2) << decode_tok_stats.min_val
+              << " — " << std::setprecision(2) << decode_tok_stats.max_val << "] ms/tok\n";
 
     std::cout << "╚══════════════════════════════════════════════════════════╝\n";
 }
@@ -364,34 +358,41 @@ int main(int argc, char** argv) {
         }
 
         std::vector<double> prefill_times;
-        std::vector<double> decode_times;
+        std::vector<double> decode_ms_per_tok;
         int prompt_tokens = 0;
-        int actual_decode_tokens = 0;
+        int last_decode_tokens = 0;
 
         for (int t = 0; t < cfg.trials; t++) {
             TrialResult result = run_trial(model, cfg);
             prefill_times.push_back(result.prefill_ms);
-            decode_times.push_back(result.decode_ms);
-            // We seem to be only using the prompt_tokens and actual_decode_tokens of the last run_trial
+
+            // Compute ms/tok for THIS trial using THIS trial's token count,
+            // so we don't mix up times from a 20-token trial with the
+            // token count from a 12-token trial that hit EOS early.
+            double ms_tok = (result.decode_tokens > 0)
+                ? result.decode_ms / static_cast<double>(result.decode_tokens)
+                : 0.0;
+            decode_ms_per_tok.push_back(ms_tok);
+
             prompt_tokens = result.prompt_tokens;
-            actual_decode_tokens = result.decode_tokens;
+            last_decode_tokens = result.decode_tokens;
 
             if (!cfg.csv_output) {
                 std::cerr << "  Trial " << (t + 1) << "/" << cfg.trials
                           << ": prefill=" << std::fixed << std::setprecision(1)
                           << result.prefill_ms << "ms"
-                          << "  decode=" << result.decode_ms << "ms"
+                          << "  decode=" << std::setprecision(2) << ms_tok << " ms/tok"
                           << " (" << result.decode_tokens << " tokens)\n";
             }
         }
 
         // ---- Compute and print stats ----
-        Stats prefill_stats = compute_stats(prefill_times);
-        Stats decode_stats  = compute_stats(decode_times);
+        Stats prefill_stats     = compute_stats(prefill_times);
+        Stats decode_tok_stats  = compute_stats(decode_ms_per_tok);
 
         print_results(cfg, backend_name, thread_count, quant_type,
-                      prompt_tokens, prefill_stats, decode_stats,
-                      actual_decode_tokens);
+                      prompt_tokens, prefill_stats, decode_tok_stats,
+                      last_decode_tokens);
 
         return 0;
     } catch (const std::exception& e) {

@@ -1,142 +1,231 @@
 # LLM Inference Engine
 
-A minimal Large Language Model inference engine built from scratch in C++20, without relying on frameworks like PyTorch or llama.cpp.
+A from-scratch Large Language Model inference engine built in C++20 with zero external dependencies. No PyTorch, no llama.cpp — every matrix multiply, every attention head, every dequantization kernel implemented from scratch.
+
+Runs TinyLlama 1.1B at **29.4 tok/s** on an M2 MacBook Air, a **49x speedup** over the naive baseline through ARM NEON SIMD, multi-threaded matmul, and weight quantization.
 
 ## Why Build This?
 
 The gap between calling `model.generate()` and understanding what actually happens inside an LLM is enormous. This project opens that black box.
 
-LLM inference is memory-bandwidth bound, the CPU spends most of its time **waiting** for weights to arrive from RAM, not computing. Once you understand this, optimization strategies become obvious: quantization (8× less data to move), memory mapping (zero-copy file access), KV caching (don't recompute), and cache-aware algorithms (keep data in L1). This project applies these principles to run a 1.1B parameter model on an M2 MacBook with 8GB RAM.
-
 Building this requires combining disciplines usually taught separately:
 
 | Domain | What's Involved |
 |--------|-----------------|
-| **Systems Programming** | Memory mapping, binary parsing, RAII |
-| **Computer Architecture** | Memory hierarchy, SIMD vectorization |
-| **Linear Algebra** | Matrix multiplication, FP16/FP32 precision |
+| **Systems Programming** | Memory mapping, binary parsing, RAII, multi-threading |
+| **Computer Architecture** | Memory hierarchy, SIMD vectorization, cache behavior |
+| **Linear Algebra** | Matrix-vector multiplication, FP16/FP32 precision |
 | **Deep Learning** | Transformers, attention, positional encodings |
-| **Optimization** | Quantization, KV caching, PagedAttention |
+| **Optimization** | Quantization, KV caching, thread scaling |
 
+## Performance
 
-## Project Goals
+All benchmarks measured on Apple M2 MacBook Air (8GB RAM) with a custom benchmarking harness using median of multiple trials with warmup isolation.
 
-- **Educational**: Understand every byte between a model file and generated text
-- **Portfolio**: Build something that shows genuine systems understanding
-- **Minimal**: Zero ML framework dependencies, just standard C++20
+### NEON SIMD Speedup (1 thread)
+
+| Format | Naive (ms/tok) | NEON (ms/tok) | Speedup |
+|--------|---------------|---------------|---------|
+| F16    | 1,697         | 73            | **23.2x** |
+| Q4_0   | 568           | 97            | **5.9x** |
+| Q8_0   | 300           | 124           | **2.4x** |
+
+### Thread Scaling (F16 naive)
+
+| Threads | ms/tok | Speedup | Efficiency |
+|---------|--------|---------|------------|
+| 1       | 1,697  | —       | —          |
+| 2       | 903    | 1.88x   | 94%        |
+| 4       | 476    | 3.57x   | 89%        |
+| 8       | 376    | 4.51x   | 56%        |
+
+### Quantization Comparison (NEON, 4 threads)
+
+| Format | Model Size | ms/tok | tok/s |
+|--------|-----------|--------|-------|
+| F16    | 2.2 GB    | 39     | 25.6  |
+| Q8_0   | 1.2 GB    | 41     | 24.3  |
+| Q4_0   | 637 MB    | 34     | **29.4** |
+
+### Peak Configuration
+
+| Metric | Value |
+|--------|-------|
+| Best throughput | **29.4 tok/s** (Q4_0, NEON, 4 threads) |
+| Best SIMD speedup | **23.2x** (F16, NEON vs naive) |
+| Best thread scaling | **4.51x** at 8 threads (F16 naive) |
+| Best compression | **3.4x** (F16 → Q4_0, 2.2 GB → 637 MB) |
+| Combined speedup | **49x** (F16 naive 1T → Q4_0 NEON 4T) |
 
 ## Architecture
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        GGUF Model File                          │
 │  ┌─────────┐  ┌──────────────┐  ┌─────────────────────────────┐ │
 │  │ Header  │  │   Metadata   │  │        Tensor Data          │ │
-│  │ (magic, │  │ (config,     │  │  (weights in F16/F32)       │ │
-│  │ version)│  │  vocab)      │  │                             │ │
+│  │ (magic, │  │ (config,     │  │  (F16 / Q8_0 / Q4_0 /      │ │
+│  │ version)│  │  vocab)      │  │   Q6_K weights)             │ │
 │  └─────────┘  └──────────────┘  └─────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────┘
         │                │                       │
         ▼                ▼                       ▼
    ┌─────────┐    ┌─────────────┐        ┌─────────────┐
    │ Parser  │    │  Tokenizer  │        │   Tensors   │
-   │         │    │             │        │  (mmap'd)   │
+   │         │    │  (BPE, 32K) │        │  (mmap'd)   │
    └─────────┘    └─────────────┘        └─────────────┘
         │                │                       │
         └────────────────┼───────────────────────┘
                          ▼
                  ┌───────────────┐
                  │   GGUFModel   │
-                 │  (main API)   │
                  └───────────────┘
+                         │
+                         ▼
+         ┌───────────────────────────────┐
+         │         Forward Pass          │
+         │  ┌─────────┐  ┌───────────┐  │
+         │  │ RMSNorm │  │ RoPE      │  │
+         │  │         │  │           │  │
+         │  └─────────┘  └───────────┘  │
+         │  ┌─────────────────────────┐  │
+         │  │  Grouped Query Attention │  │
+         │  │  (with KV Cache)        │  │
+         │  └─────────────────────────┘  │
+         │  ┌─────────────────────────┐  │
+         │  │  SwiGLU FFN             │  │
+         │  └─────────────────────────┘  │
+         │         × 22 layers           │
+         └───────────────────────────────┘
+                         │
+                         ▼
+         ┌───────────────────────────────┐
+         │          Generation           │
+         │  Sampling: argmax / temp /    │
+         │  top-p nucleus                │
+         └───────────────────────────────┘
 ```
 
-## Completed Phases
+## Features
 
-### Phase 2: GGUF Parser
-- Memory-mapped file I/O for efficient model loading
-- Complete GGUF header and metadata parsing
-- Tensor index with offset computation and bounds checking
-- Support for F16 and F32 data types
+### Model Loading
+- Memory-mapped file I/O (`mmap`) for zero-copy weight access
+- Complete GGUF header, metadata, and tensor parsing
+- Support for F16, F32, Q8_0, Q4_0, and Q6_K weight formats
 
-### Phase 2.5: Model Configuration
-- Extract all Llama architecture parameters from metadata
-- Support for Grouped Query Attention (GQA) configuration
-- RoPE positional encoding parameters
+### Transformer Implementation
+- Full Llama architecture across 22 transformer layers
+- Grouped Query Attention (GQA) with 32 query heads and 4 key-value heads
+- Rotary Positional Encoding (RoPE)
+- RMSNorm pre-normalization
+- SwiGLU feed-forward network
+- KV cache for autoregressive generation
 
-### Phase 3: Tokenizer
+### Tokenizer
 - BPE tokenization with greedy longest-match algorithm
 - SentencePiece-compatible space handling (▁ character)
+- 32,000 token vocabulary loaded from GGUF metadata
 - Encode/decode with round-trip verification
-- 32,000 token vocabulary from GGUF metadata
 
-## Upcoming Phases
+### NEON SIMD Optimization
+- Vectorized matmul for F16, Q8_0, Q4_0, and Q6_K formats
+- 4 independent accumulators processing 16 floats per iteration
+- Hardware FP16→FP32 conversion (`vcvt_f32_f16`)
+- Fused multiply-add (`vfmaq_f32`)
+- NEON-optimized RMSNorm, element-wise multiply, and vector add
+- Runtime backend selection (`--backend naive` or `--backend neon`)
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 4 | Matrix multiplication | Next |
-| 5 | Transformer components (RMSNorm, RoPE, Attention) | Planned |
-| 6 | Forward pass & text generation | Planned |
-| 7 | KV Cache | Planned |
-| 8 | SIMD optimization (ARM NEON) | Planned |
-| 9 | Quantization optimization | Planned |
-| 10 | PagedAttention optimization | Planned |
+### Multi-Threading
+- Row-level parallel matmul via `parallel_for` template
+- Configurable thread count (`--threads N`)
+- Optimal at 4 threads on M2 (4 performance cores)
 
+### Sampling Strategies
+- Argmax (greedy decoding)
+- Temperature scaling
+- Top-p (nucleus) sampling
 
-## Technical Details
-
-### Target Model
-- **Model**: TinyLlama-1.1B-Chat-v1.0
-- **Format**: GGUF (F16 weights)
-- **Architecture**: Llama (22 layers, 2048 hidden dim, 32 heads)
-
-### Key Techniques
-| Component | Technique |
-|-----------|-----------|
-| File I/O | Memory mapping (`mmap`) for zero-copy access |
-| Tokenization | Greedy longest-match BPE |
-| Memory safety | RAII wrappers, bounds checking |
-| Unicode | UTF-8 handling for SentencePiece compatibility |
-
-### Hardware
-- Apple MacBook Air M2 (8GB RAM)
-- ARM64 architecture (NEON SIMD planned)
+### Benchmarking
+- Separate prefill and decode timing
+- Configurable warmup, trials, and decode token count
+- Per-trial ms/tok computation (handles early EOS correctly)
+- Statistical reporting: median, mean, stddev, range
 
 ## Project Structure
+
 ```
 inference-engine/
 ├── src/
-│   ├── main.cpp        # Entry point, GGUFModel class
-│   ├── gguf.h          # GGUF types and config structs
-│   ├── tokenizer.h     # Tokenizer class declaration
-│   ├── tokenizer.cpp   # Tokenizer implementation
-│   ├── ops.h           # Tensor operations (coming soon)
-│   └── ops.cpp         # MatMul implementation (coming soon)
-├── models/             # GGUF model files (not in repo)
+│   ├── main.cpp           # Entry point, CLI argument parsing
+│   ├── gguf.h             # GGUF types, quantization block structs
+│   ├── gguf_model.h       # GGUFModel class declaration
+│   ├── gguf_model.cpp     # GGUF parser, mmap, tensor loading
+│   ├── tokenizer.h        # Tokenizer class declaration
+│   ├── tokenizer.cpp      # BPE encode/decode implementation
+│   ├── ops.h              # Operation interfaces, backend selection
+│   ├── ops.cpp            # Naive + NEON implementations of all ops
+│   ├── forward.h          # Forward pass declaration
+│   ├── forward.cpp        # 22-layer transformer forward pass
+│   ├── generate.h         # Generation loop declaration
+│   ├── generate.cpp       # Prefill + decode with sampling
+│   ├── run_state.h        # Runtime memory allocation (KV cache, scratch)
+│   ├── benchmark.cpp      # Benchmarking harness
+│   └── test_ops.cpp       # Unit tests for tensor operations
+├── models/                # GGUF model files (not in repo)
 ├── Makefile
 └── README.md
 ```
 
-## Requirements
-
-This project requires a GGUF model file. This model has been used for implementation:
-
-- [tinyllama-1.1b-chat-v1.0.f16.gguf](https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/blob/main/tinyllama-1.1b-chat-v1.0.f16.gguf)
-
-Place it in the `models/` directory.
-
-
 ## Building & Running
+
 ```bash
-# Build
+# Build the engine
 make
 
-# Run
-./engine models/tinyllama-1.1b-chat-v1.0.f16.gguf
+# Run inference
+./engine models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf --backend neon --threads 4
 
-# Clean
-make clean
+# Run with custom prompt
+./engine models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf --backend neon --threads 4 \
+    --prompt "What is the meaning of life?"
+
+# Build and run benchmarks
+make benchmark
+./benchmark models/tinyllama-1.1b-chat-v1.0.Q4_0.gguf --backend neon --threads 4
+
+# Run unit tests
+make test
 ```
 
+### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--backend naive\|neon` | Computation backend | `neon` on ARM |
+| `--threads N` | Number of threads for matmul | `1` |
+| `--prompt "text"` | Input prompt | Chat template |
+| `--temperature F` | Sampling temperature | `0.7` |
+| `--top_p F` | Nucleus sampling threshold | `0.9` |
+| `--max_tokens N` | Maximum tokens to generate | `2048` |
+
+## Model Files
+
+This project supports TinyLlama 1.1B in multiple quantization formats:
+
+| Format | File | Size | Download |
+|--------|------|------|----------|
+| F16 | `tinyllama-1.1b-chat-v1.0.f16.gguf` | 2.2 GB | [HuggingFace](https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/blob/main/tinyllama-1.1b-chat-v1.0.f16.gguf) |
+| Q8_0 | `tinyllama-1.1b-chat-v1.0.Q8_0.gguf` | 1.2 GB | [HuggingFace](https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/blob/main/tinyllama-1.1b-chat-v1.0.Q8_0.gguf) |
+| Q4_0 | `tinyllama-1.1b-chat-v1.0.Q4_0.gguf` | 637 MB | [HuggingFace](https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/blob/main/tinyllama-1.1b-chat-v1.0.Q4_0.gguf) |
+| Q6_K | `tinyllama-1.1b-chat-v1.0.Q6_K.gguf` | 903 MB | [HuggingFace](https://huggingface.co/pbatra/TinyLlama-1.1B-Chat-v1.0-GGUF/blob/main/tinyllama-1.1b-chat-v1.0.Q6_K.gguf) |
+
+Place model files in the `models/` directory.
+
+## Hardware
+
+- **Tested on**: Apple MacBook Air M2 (8GB RAM)
+- **Architecture**: ARM64 with NEON SIMD
+- **Optimal config**: 4 threads (M2 has 4 performance + 4 efficiency cores)
 
 ## Learning Resources
 

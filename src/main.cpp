@@ -60,13 +60,14 @@ int main(int argc, char** argv) {
     try {
         if (argc < 2) {
             std::cerr << "Usage:\n"
-                      << "  ./engine <model.gguf> \"prompt text\"\n"
-                      << "  ./engine <model.gguf>                    (default prompt)\n"
-                      << "  ./engine <model.gguf> dump <tensor> [n]  (dump tensor)\n"
+                      << "  ./engine <model.gguf>                           (default prompt)\n"
+                      << "  ./engine <model.gguf> --prompt \"your question\"  (custom prompt)\n"
+                      << "  ./engine <model.gguf> dump <tensor> [n]         (dump tensor)\n"
                       << "\nOptions:\n"
                       << "  --backend naive   Use naive (unoptimized) implementations\n"
                       << "  --backend neon    Use ARM NEON SIMD implementations (default on ARM)\n"
-                      << "  --threads N       Number of threads for matmul (default: 1)\n";
+                      << "  --threads N       Number of threads for matmul (default: 1)\n"
+                      << "  --prompt \"text\"   Custom prompt (auto-wrapped in chat template)\n";
             return 1;
         }
 
@@ -77,7 +78,12 @@ int main(int argc, char** argv) {
                 if (val == "naive") {
                     set_backend(Backend::NAIVE);
                 } else if (val == "neon") {
-                    set_backend(Backend::NEON);
+                    #ifdef __ARM_NEON
+                        set_backend(Backend::NEON);
+                    #else
+                        std::cerr << "Warning: ARM NEON not available on this platform, using naive backend.\n";
+                        set_backend(Backend::NAIVE);
+                    #endif
                 } else {
                     std::cerr << "Unknown backend: " << val << " (use 'naive' or 'neon')\n";
                     return 1;
@@ -106,7 +112,35 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::cout << "Backend: " << (get_backend() == Backend::NEON ? "NEON" : "naive")
+        // Parse --prompt flag (can appear anywhere in args)
+        std::string user_prompt;
+        bool has_prompt = false;
+        for (int i = 1; i < argc - 1; i++) {
+            if (std::strcmp(argv[i], "--prompt") == 0) {
+                user_prompt = argv[i + 1];
+                has_prompt = true;
+                for (int j = i; j < argc - 2; j++) {
+                    argv[j] = argv[j + 2];
+                }
+                argc -= 2;
+                break;
+            }
+        }
+
+        // Get prompt from command line or use default
+        std::string prompt;
+        if (has_prompt) {
+            // Wrap user input in TinyLlama chat template
+            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\n"
+                + user_prompt
+                + "</s>\n<|assistant|>\n";
+        } else {
+            // TinyLlama chat template format
+            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nHow do people feel on a daily basis?</s>\n<|assistant|>\n";
+        }
+
+
+        std::cout << "\nBackend: " << (get_backend() == Backend::NEON ? "NEON" : "naive")
                   << " | Threads: " << get_num_threads() << "\n";
 
         std::string path = argv[1];
@@ -133,16 +167,7 @@ int main(int argc, char** argv) {
         RunState state;
         state.allocate(model.config());
 
-        // Get prompt from command line or use default
-        std::string prompt;
-        if (argc >= 3) {
-            prompt = argv[2];
-        } else {
-            // TinyLlama chat template format
-            prompt = "<|system|>\nYou are a helpful assistant.</s>\n<|user|>\nWhat is the meaning of life</s>\n<|assistant|>\n";
-        }
-
-        std::cout << "Prompt: \"" << prompt << "\"\n";
+        //std::cout << "\n\nPrompt: \"" << prompt << "\"\n";
         std::cout << "Generating...\n\n";
 
         generate(model, state, prompt);

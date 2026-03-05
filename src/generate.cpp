@@ -45,12 +45,6 @@ void generate(GGUFModel& model, RunState& state,
     // Prepend BOS token (the model expects this at the start)
     prompt_tokens.insert(prompt_tokens.begin(), tok.bos_token());
 
-    std::cout << "Prompt tokens: " << prompt_tokens.size() << " [";
-    for (size_t i = 0; i < prompt_tokens.size(); i++) {
-        std::cout << prompt_tokens[i];
-        if (i + 1 < prompt_tokens.size()) std::cout << ", ";
-    }
-    std::cout << "]\n\n";
 
     // ---- Step 2: Prefill — process prompt tokens ----
     // Run forward pass for each prompt token to fill KV cache.

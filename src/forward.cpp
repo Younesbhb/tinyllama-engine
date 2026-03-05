@@ -87,6 +87,49 @@ static void embed_token(float* out, const GGUFModel& model, int token) {
                 out[base_idx + j + QK4_0 / 2]  = static_cast<float>(v1) * scale;
             }
         }
+    } else if (t.type == GGML_TYPE_Q6_K) {
+        // Each row is (n_embd / 256) super-blocks, each block is 210 bytes
+        int blocks_per_row = n_embd / QK_K;
+        const block_q6_K* blocks = reinterpret_cast<const block_q6_K*>(data);
+        const block_q6_K* row = blocks + static_cast<std::size_t>(token) * blocks_per_row;
+
+        for (int b = 0; b < blocks_per_row; b++) {
+            float d = fp16_to_f32(row[b].d);
+            const std::uint8_t* ql = row[b].ql;
+            const std::uint8_t* qh = row[b].qh;
+            const std::int8_t*  sc = row[b].scales;
+            int base_idx = b * QK_K;
+
+            // First half: elements 0-127
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+
+                int q1 = (static_cast<int>(ql[l]      & 0x0F) | (static_cast<int>((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (static_cast<int>(ql[l + 32]  & 0x0F) | (static_cast<int>((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (static_cast<int>(ql[l]      >> 4)    | (static_cast<int>((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (static_cast<int>(ql[l + 32]  >> 4)    | (static_cast<int>((qh[l] >> 6) & 3) << 4)) - 32;
+
+                out[base_idx + l +  0] = d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1);
+                out[base_idx + l + 32] = d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2);
+                out[base_idx + l + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
+                out[base_idx + l + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
+            }
+
+            // Second half: elements 128-255
+            for (int l = 0; l < 32; l++) {
+                int is = l / 16;
+
+                int q1 = (static_cast<int>(ql[l + 64]  & 0x0F) | (static_cast<int>((qh[l + 32] >> 0) & 3) << 4)) - 32;
+                int q2 = (static_cast<int>(ql[l + 96]  & 0x0F) | (static_cast<int>((qh[l + 32] >> 2) & 3) << 4)) - 32;
+                int q3 = (static_cast<int>(ql[l + 64]  >> 4)    | (static_cast<int>((qh[l + 32] >> 4) & 3) << 4)) - 32;
+                int q4 = (static_cast<int>(ql[l + 96]  >> 4)    | (static_cast<int>((qh[l + 32] >> 6) & 3) << 4)) - 32;
+
+                out[base_idx + l + 128] = d * static_cast<float>(sc[is +  8]) * static_cast<float>(q1);
+                out[base_idx + l + 160] = d * static_cast<float>(sc[is + 10]) * static_cast<float>(q2);
+                out[base_idx + l + 192] = d * static_cast<float>(sc[is + 12]) * static_cast<float>(q3);
+                out[base_idx + l + 224] = d * static_cast<float>(sc[is + 14]) * static_cast<float>(q4);
+            }
+        }
     } else {
         throw std::runtime_error("Unsupported embedding type");
     }
