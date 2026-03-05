@@ -4,7 +4,7 @@ A from-scratch Large Language Model inference engine built in C++20 with zero ex
 
 Runs TinyLlama 1.1B at **29.4 tok/s** on an M2 MacBook Air, a **49x speedup** over the naive baseline through ARM NEON SIMD, multi-threaded matmul, and weight quantization.
 
-## Why Build This?
+## Why It Matters
 
 Every LLM query costs compute time, memory, and energy. As companies deploy billions of inference requests per day, the difference between a naive implementation and an optimized one translates directly to hardware costs and user-facing latency. This project demonstrates those optimizations from first principles — SIMD to accelerate math, multi-threading to parallelize work, and quantization to shrink the model — achieving a combined 49x speedup on commodity hardware.
 
