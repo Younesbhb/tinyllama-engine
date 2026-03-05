@@ -1,12 +1,12 @@
 # LLM Inference Engine
 
-A from-scratch Large Language Model inference engine built in C++20 with zero external dependencies. No PyTorch, no llama.cpp — every matrix multiply, every attention head, every dequantization kernel implemented from scratch.
+A from-scratch Large Language Model inference engine built in C++20 with zero external dependencies. No PyTorch, no llama.cpp, every matrix multiply, every attention head, every dequantization kernel implemented from scratch.
 
 Runs TinyLlama 1.1B at **29.4 tok/s** on an M2 MacBook Air, a **49x speedup** over the naive baseline through ARM NEON SIMD, multi-threaded matmul, and weight quantization.
 
 ## Why It Matters
 
-Every LLM query costs compute time, memory, and energy. As companies deploy billions of inference requests per day, the difference between a naive implementation and an optimized one translates directly to hardware costs and user-facing latency. This project demonstrates those optimizations from first principles — SIMD to accelerate math, multi-threading to parallelize work, and quantization to shrink the model — achieving a combined 49x speedup on commodity hardware.
+Every LLM query costs compute time, memory, and energy. As companies deploy billions of inference requests per day, the difference between a naive implementation and an optimized one translates directly to hardware costs and user-facing latency. This project demonstrates those optimizations from first principles : SIMD to accelerate math, multi-threading to parallelize work, and quantization to shrink the model — achieving a combined 49x speedup on commodity hardware.
 
 The gap between calling `model.generate()` and understanding what actually happens inside an LLM is enormous. This project opens that black box, combining disciplines usually taught separately:
 
