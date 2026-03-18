@@ -9,12 +9,6 @@ Side-by-side comparison of the slowest configuration (F16, naive backend, 1 thre
 against the fastest (Q4_0, NEON SIMD, 4 threads), demonstrating the 49x speedup 
 in real-time token generation.
 
-
-
-https://github.com/user-attachments/assets/32273c3a-3154-4ff0-b540-49cdd81edf6c
-
-
-
 https://github.com/user-attachments/assets/701615f4-ca66-4c5c-9a79-d64db419a4d4
 
 
